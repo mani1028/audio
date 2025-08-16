@@ -20,7 +20,7 @@ app.add_middleware(
 MANIFEST_FILE = "hosted_songs_manifest.json"
 
 # Jam Session Management
-active_jams: Dict[str, Dict] = {}  # {jam_id: {host_ws: WebSocket, guests: List[WebSocket], current_song: dict, is_playing: bool, position: float}}
+active_jams: Dict[str, Dict] = {}  # {jam_id: {host_ws: WebSocket, guests: List[WebSocket], current_song: dict, playlist: List[dict], is_playing: bool, position: float}}
 
 def load_songs():
     try:
@@ -65,6 +65,19 @@ async def get_songs():
         return JSONResponse(content=songs, status_code=404)
     return JSONResponse(content=songs, status_code=200)
 
+@app.get("/get-jam-playlist/{jam_id}")
+async def get_jam_playlist(jam_id: str):
+    if jam_id not in active_jams:
+        return JSONResponse({"error": "Jam session not found"}, status_code=404)
+    
+    jam_session = active_jams[jam_id]
+    return JSONResponse({
+        "current_song": jam_session["current_song"],
+        "playlist": jam_session.get("playlist", []),
+        "is_playing": jam_session["is_playing"],
+        "position": jam_session["position"]
+    })
+
 @app.get("/load-audio")
 async def load_audio(path: str):
     if path.startswith(("http://", "https://")):
@@ -77,6 +90,19 @@ async def load_audio(path: str):
         return JSONResponse({"error": "File not found"}, status_code=404)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/create-jam")
+async def create_jam():
+    jam_id = str(uuid.uuid4())[:8]
+    active_jams[jam_id] = {
+        "host_ws": None,
+        "guests": [],
+        "current_song": None,
+        "playlist": [],
+        "is_playing": False,
+        "position": 0
+    }
+    return {"jam_id": jam_id}
 
 @app.websocket("/ws/jam/{jam_id}")
 async def websocket_jam(websocket: WebSocket, jam_id: str):
@@ -94,12 +120,19 @@ async def websocket_jam(websocket: WebSocket, jam_id: str):
             await websocket.send_json({
                 "type": "sync",
                 "song": jam_session["current_song"],
+                "playlist": jam_session.get("playlist", []),
                 "is_playing": jam_session["is_playing"],
                 "position": jam_session["position"]
             })
         
         # Add to participants
-        if websocket != jam_session["host_ws"]:  # Don't add host to guests list
+        if websocket == jam_session["host_ws"]:
+            pass  # Host is already set
+        elif jam_session["host_ws"] is None:
+            # First connection becomes host
+            jam_session["host_ws"] = websocket
+        else:
+            # Add as guest
             jam_session["guests"].append(websocket)
         
         while True:
@@ -138,6 +171,25 @@ async def websocket_jam(websocket: WebSocket, jam_id: str):
                             })
                         except:
                             continue
+            
+            elif data["type"] == "playlist_update":
+                if websocket == jam_session["host_ws"]:
+                    jam_session["playlist"] = data["playlist"]
+                    for guest in jam_session["guests"]:
+                        try:
+                            await guest.send_json({
+                                "type": "playlist_update",
+                                "playlist": data["playlist"]
+                            })
+                        except:
+                            continue
+            
+            elif data["type"] == "host_init":
+                if websocket == jam_session["host_ws"]:
+                    jam_session["current_song"] = data.get("song")
+                    jam_session["playlist"] = data.get("playlist", [])
+                    jam_session["is_playing"] = data.get("is_playing", False)
+                    jam_session["position"] = data.get("position", 0)
     
     except WebSocketDisconnect:
         if websocket == jam_session["host_ws"]:
@@ -155,18 +207,6 @@ async def websocket_jam(websocket: WebSocket, jam_id: str):
             # Guest disconnected
             if websocket in jam_session["guests"]:
                 jam_session["guests"].remove(websocket)
-
-@app.get("/create-jam")
-async def create_jam():
-    jam_id = str(uuid.uuid4())[:8]
-    active_jams[jam_id] = {
-        "host_ws": None,
-        "guests": [],
-        "current_song": None,
-        "is_playing": False,
-        "position": 0
-    }
-    return {"jam_id": jam_id}
 
 frontend_html = """<!DOCTYPE html>
 <html lang="en">
@@ -621,18 +661,41 @@ frontend_html = """<!DOCTYPE html>
             jamSocket.onopen = () => {
                 console.log("WebSocket connected");
                 if (asHost) {
-                    // Set as host in the backend
-                    active_jams[jamId]["host_ws"] = jamSocket;
-                    
                     // Send initial state if we have a current song
                     if (audioPlayer.currentSong) {
                         jamSocket.send(JSON.stringify({
                             type: "host_init",
                             song: audioPlayer.currentSong,
+                            playlist: currentPlaylist,
                             is_playing: isPlaying,
                             position: audioPlayer.currentTime
                         }));
                     }
+                } else {
+                    // Request initial sync as guest
+                    fetch(`/get-jam-playlist/${jamId}`)
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.error) {
+                                console.error(data.error);
+                                return;
+                            }
+                            
+                            // Update playlist
+                            if (data.playlist && data.playlist.length > 0) {
+                                currentPlaylist = data.playlist;
+                                renderPlaylist();
+                            }
+                            
+                            // Sync current song
+                            if (data.current_song) {
+                                playSong(data.current_song, data.position);
+                                if (data.is_playing) {
+                                    audioPlayer.play().catch(console.error);
+                                }
+                            }
+                        })
+                        .catch(console.error);
                 }
             };
             
@@ -670,6 +733,12 @@ frontend_html = """<!DOCTYPE html>
                         playSong(data.song, data.position);
                     }
                 }
+                else if (data.type === "playlist_update") {
+                    if (!isHost && data.playlist) {
+                        currentPlaylist = data.playlist;
+                        renderPlaylist();
+                    }
+                }
                 else if (data.type === "jam_ended") {
                     alert("Host has ended the jam session");
                     endJamSession();
@@ -687,6 +756,15 @@ frontend_html = """<!DOCTYPE html>
                 console.error("WebSocket error:", error);
                 endJamSession();
             };
+        }
+
+        function syncPlaylistWithGuests() {
+            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+                jamSocket.send(JSON.stringify({
+                    type: "playlist_update",
+                    playlist: currentPlaylist
+                }));
+            }
         }
 
         // --- Playlist Management ---
@@ -744,6 +822,7 @@ frontend_html = """<!DOCTYPE html>
         function addSongToPlaylist(song) {
             currentPlaylist.push(song);
             renderPlaylist();
+            syncPlaylistWithGuests();
         }
 
         function removeSongFromPlaylist(songId) {
@@ -766,6 +845,7 @@ frontend_html = """<!DOCTYPE html>
             }
 
             renderPlaylist();
+            syncPlaylistWithGuests();
         }
 
         function playNextSong() {
