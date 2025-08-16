@@ -1,11 +1,14 @@
 import os
 import json
 import uuid
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import time
+import zlib
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
+from datetime import datetime
 
 app = FastAPI()
 app.add_middleware(
@@ -20,7 +23,7 @@ app.add_middleware(
 MANIFEST_FILE = "hosted_songs_manifest.json"
 
 # Jam Session Management
-active_jams: Dict[str, Dict] = {}  # {jam_id: {host_ws: WebSocket, guests: List[WebSocket], current_song: dict, playlist: List[dict], is_playing: bool, position: float}}
+active_jams: Dict[str, Dict] = {}  # {jam_id: {host: {ws: WebSocket, name: str}, guests: List[{ws: WebSocket, name: str, join_time: str}], current_song: dict, playlist: List[dict], is_playing: bool, position: float, created_at: str}}
 
 def load_songs():
     try:
@@ -54,6 +57,14 @@ def load_songs():
     except Exception as e:
         return {"error": str(e)}
 
+async def send_compressed(websocket: WebSocket, data: dict):
+    try:
+        json_str = json.dumps(data)
+        compressed = zlib.compress(json_str.encode('utf-8'))
+        await websocket.send_bytes(compressed)
+    except Exception as e:
+        print(f"Error sending compressed data: {e}")
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(content=frontend_html, status_code=200)
@@ -75,7 +86,10 @@ async def get_jam_playlist(jam_id: str):
         "current_song": jam_session["current_song"],
         "playlist": jam_session.get("playlist", []),
         "is_playing": jam_session["is_playing"],
-        "position": jam_session["position"]
+        "position": jam_session["position"],
+        "host": {"name": jam_session["host"]["name"]},
+        "guests": [{"name": guest["name"], "join_time": guest["join_time"]} for guest in jam_session["guests"]],
+        "created_at": jam_session["created_at"]
     })
 
 @app.get("/load-audio")
@@ -92,20 +106,30 @@ async def load_audio(path: str):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/create-jam")
-async def create_jam():
+async def create_jam(name: str = Query("Host", min_length=1, max_length=20)):
     jam_id = str(uuid.uuid4())[:8]
     active_jams[jam_id] = {
-        "host_ws": None,
+        "host": {"ws": None, "name": name},
         "guests": [],
         "current_song": None,
         "playlist": [],
         "is_playing": False,
-        "position": 0
+        "position": 0,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_update_time": 0
     }
-    return {"jam_id": jam_id}
+    return {
+        "jam_id": jam_id,
+        "host_name": name,
+        "created_at": active_jams[jam_id]["created_at"]
+    }
 
 @app.websocket("/ws/jam/{jam_id}")
-async def websocket_jam(websocket: WebSocket, jam_id: str):
+async def websocket_jam(
+    websocket: WebSocket, 
+    jam_id: str, 
+    username: str = "Guest"
+):
     await websocket.accept()
     
     if jam_id not in active_jams:
@@ -113,100 +137,168 @@ async def websocket_jam(websocket: WebSocket, jam_id: str):
         return
     
     jam_session = active_jams[jam_id]
+    is_host = False
     
     try:
-        # Send current state to new participant
-        if jam_session["current_song"]:
-            await websocket.send_json({
-                "type": "sync",
-                "song": jam_session["current_song"],
-                "playlist": jam_session.get("playlist", []),
-                "is_playing": jam_session["is_playing"],
-                "position": jam_session["position"]
-            })
-        
-        # Add to participants
-        if websocket == jam_session["host_ws"]:
-            pass  # Host is already set
-        elif jam_session["host_ws"] is None:
+        # Set as host or add as guest
+        if jam_session["host"]["ws"] is None:
             # First connection becomes host
-            jam_session["host_ws"] = websocket
+            jam_session["host"]["ws"] = websocket
+            jam_session["host"]["name"] = username
+            is_host = True
         else:
             # Add as guest
-            jam_session["guests"].append(websocket)
+            guest = {
+                "ws": websocket, 
+                "name": username,
+                "join_time": datetime.now().strftime("%H:%M:%S")
+            }
+            jam_session["guests"].append(guest)
         
+        # Send initial sync data with compressed WebSocket
+        await send_compressed(websocket, {
+            "type": "initial_sync",
+            "current_song": jam_session["current_song"],
+            "playlist": jam_session["playlist"],
+            "is_playing": jam_session["is_playing"],
+            "position": jam_session["position"],
+            "host": {"name": jam_session["host"]["name"]},
+            "guests": [{"name": guest["name"], "join_time": guest["join_time"]} for guest in jam_session["guests"]],
+            "session_created": jam_session["created_at"],
+            "you_are_host": is_host
+        })
+        
+        # Broadcast participant update
+        await broadcast_participants_update(jam_id)
+        
+        # Main message loop
         while True:
             data = await websocket.receive_json()
             
             if data["type"] == "host_update":
-                # Only host can send updates
-                if websocket == jam_session["host_ws"]:
+                if websocket == jam_session["host"]["ws"]:
+                    current_time = time.time()
+                    # Throttle updates to prevent flooding
+                    if current_time - jam_session["last_update_time"] < 0.1:  # 100ms throttle
+                        continue
+                    jam_session["last_update_time"] = current_time
+                    
                     jam_session["is_playing"] = data["is_playing"]
                     jam_session["position"] = data["position"]
-                    
-                    # Broadcast to all guests
-                    for guest in jam_session["guests"]:
-                        try:
-                            await guest.send_json({
-                                "type": "sync",
-                                "is_playing": data["is_playing"],
-                                "position": data["position"]
-                            })
-                        except:
-                            continue
+                    await broadcast_to_guests(jam_id, {
+                        "type": "sync",
+                        "is_playing": data["is_playing"],
+                        "position": data["position"]
+                    })
             
             elif data["type"] == "song_change":
-                if websocket == jam_session["host_ws"]:
+                if websocket == jam_session["host"]["ws"]:
                     jam_session["current_song"] = data["song"]
                     jam_session["is_playing"] = True
                     jam_session["position"] = 0
-                    
-                    for guest in jam_session["guests"]:
-                        try:
-                            await guest.send_json({
-                                "type": "song_change",
-                                "song": data["song"],
-                                "is_playing": True,
-                                "position": 0
-                            })
-                        except:
-                            continue
+                    await broadcast_to_guests(jam_id, {
+                        "type": "song_change",
+                        "song": data["song"],
+                        "is_playing": True,
+                        "position": 0
+                    })
             
             elif data["type"] == "playlist_update":
-                if websocket == jam_session["host_ws"]:
+                if websocket == jam_session["host"]["ws"]:
                     jam_session["playlist"] = data["playlist"]
-                    for guest in jam_session["guests"]:
-                        try:
-                            await guest.send_json({
-                                "type": "playlist_update",
-                                "playlist": data["playlist"]
-                            })
-                        except:
-                            continue
+                    await broadcast_to_guests(jam_id, {
+                        "type": "playlist_update",
+                        "playlist": data["playlist"]
+                    })
             
-            elif data["type"] == "host_init":
-                if websocket == jam_session["host_ws"]:
-                    jam_session["current_song"] = data.get("song")
-                    jam_session["playlist"] = data.get("playlist", [])
-                    jam_session["is_playing"] = data.get("is_playing", False)
-                    jam_session["position"] = data.get("position", 0)
+            elif data["type"] == "chat_message":
+                await broadcast_chat_message(jam_id, {
+                    "sender": username,
+                    "message": data["message"],
+                    "timestamp": datetime.now().strftime("%H:%M")
+                })
     
     except WebSocketDisconnect:
-        if websocket == jam_session["host_ws"]:
-            # Host disconnected - end jam session
-            for guest in jam_session["guests"]:
-                try:
-                    await guest.send_json({
-                        "type": "jam_ended"
-                    })
-                    await guest.close()
-                except:
-                    continue
+        if websocket == jam_session["host"]["ws"]:
+            # Host disconnected - end session
+            await broadcast_to_guests(jam_id, {
+                "type": "jam_ended",
+                "reason": f"Host {jam_session['host']['name']} left the session"
+            })
+            await close_all_guests(jam_id)
             del active_jams[jam_id]
         else:
             # Guest disconnected
-            if websocket in jam_session["guests"]:
-                jam_session["guests"].remove(websocket)
+            jam_session["guests"] = [
+                guest for guest in jam_session["guests"] 
+                if guest["ws"] != websocket
+            ]
+            await broadcast_participants_update(jam_id)
+
+async def broadcast_to_guests(jam_id: str, message: dict):
+    if jam_id not in active_jams:
+        return
+        
+    for guest in active_jams[jam_id]["guests"]:
+        try:
+            await send_compressed(guest["ws"], message)
+        except:
+            continue
+
+async def close_all_guests(jam_id: str):
+    if jam_id not in active_jams:
+        return
+        
+    for guest in active_jams[jam_id]["guests"]:
+        try:
+            await guest["ws"].close()
+        except:
+            continue
+
+async def broadcast_participants_update(jam_id: str):
+    if jam_id not in active_jams:
+        return
+        
+    jam_session = active_jams[jam_id]
+    update = {
+        "type": "participants_update",
+        "host": {"name": jam_session["host"]["name"]},
+        "guests": [{"name": guest["name"], "join_time": guest["join_time"]} for guest in jam_session["guests"]]
+    }
+    
+    # Send to host
+    if jam_session["host"]["ws"]:
+        try:
+            await send_compressed(jam_session["host"]["ws"], update)
+        except:
+            pass
+    
+    # Send to all guests
+    await broadcast_to_guests(jam_id, update)
+
+async def broadcast_chat_message(jam_id: str, message: dict):
+    if jam_id not in active_jams:
+        return
+        
+    jam_session = active_jams[jam_id]
+    chat_msg = {
+        "type": "chat_message",
+        "sender": message["sender"],
+        "message": message["message"],
+        "timestamp": message["timestamp"],
+        "is_host": message["sender"] == jam_session["host"]["name"]
+    }
+    
+    # Send to host
+    if jam_session["host"]["ws"]:
+        try:
+            await send_compressed(jam_session["host"]["ws"], chat_msg)
+        except:
+            pass
+    
+    # Send to all guests
+    await broadcast_to_guests(jam_id, chat_msg)
+
 
 frontend_html = """<!DOCTYPE html>
 <html lang="en">
@@ -215,6 +307,7 @@ frontend_html = """<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Audio Player</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <style>
@@ -271,6 +364,51 @@ frontend_html = """<!DOCTYPE html>
             font-weight: 600;
             box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
         }
+        .participant-badge {
+            display: inline-flex;
+            align-items: center;
+            background-color: #e0e7ff;
+            color: #4f46e5;
+            padding: 0.25rem 0.5rem;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            margin-right: 0.25rem;
+            margin-bottom: 0.25rem;
+        }
+        .host-badge {
+            background-color: #d1fae5;
+            color: #065f46;
+        }
+        .chat-container {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid #e5e7eb;
+            border-radius: 0.5rem;
+            padding: 0.5rem;
+            background-color: #f9fafb;
+            margin-top: 1rem;
+        }
+        .chat-message {
+            margin-bottom: 0.5rem;
+            padding: 0.5rem;
+            border-radius: 0.375rem;
+            background-color: white;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        .host-message {
+            border-left: 3px solid #10b981;
+        }
+        .guest-message {
+            border-left: 3px solid #3b82f6;
+        }
+        .message-sender {
+            font-weight: 600;
+            margin-right: 0.5rem;
+        }
+        .message-time {
+            font-size: 0.75rem;
+            color: #6b7280;
+        }
         @media (max-width: 768px) {
             body {
                 flex-direction: column;
@@ -313,6 +451,22 @@ frontend_html = """<!DOCTYPE html>
             
             <div id="jam-guest-info" class="hidden">
                 <p class="text-xs text-gray-600">Connected to host's session</p>
+            </div>
+            
+            <div id="participants-container" class="mt-3 hidden">
+                <div class="text-xs text-gray-500 mb-1">Participants:</div>
+                <div id="participants-list" class="flex flex-wrap"></div>
+            </div>
+            
+            <div id="chat-section" class="mt-4 hidden">
+                <div class="flex items-center mb-2">
+                    <input type="text" id="chat-input" placeholder="Type a message..." 
+                           class="flex-grow px-3 py-2 border border-gray-300 rounded-l-md focus:ring-indigo-500 focus:border-indigo-500 text-sm">
+                    <button id="send-chat-button" class="px-3 py-2 bg-indigo-600 text-white rounded-r-md hover:bg-indigo-700">
+                        <i class="fas fa-paper-plane"></i>
+                    </button>
+                </div>
+                <div id="chat-container" class="chat-container"></div>
             </div>
         </div>
 
@@ -437,6 +591,14 @@ frontend_html = """<!DOCTYPE html>
         const jamLinkInput = document.getElementById('jam-link-input');
         const jamCopyLink = document.getElementById('jam-copy-link');
         const jamGuestInfo = document.getElementById('jam-guest-info');
+        const participantsContainer = document.getElementById('participants-container');
+        const participantsList = document.getElementById('participants-list');
+        
+        // Chat elements
+        const chatSection = document.getElementById('chat-section');
+        const chatInput = document.getElementById('chat-input');
+        const sendChatButton = document.getElementById('send-chat-button');
+        const chatContainer = document.getElementById('chat-container');
 
         let currentPlaylist = [];
         let currentSongIndex = -1;
@@ -447,6 +609,7 @@ frontend_html = """<!DOCTYPE html>
         let jamId = null;
         let lastSyncTime = 0;
         let syncInterval;
+        let username = "Guest";
 
         // --- Audio Player Logic ---
         function playSong(song, seekTime = 0) {
@@ -572,10 +735,47 @@ frontend_html = """<!DOCTYPE html>
             return `${minutes}:${secs < 10 ? '0' : ''}${secs}`;
         }
 
+        // --- Chat Functions ---
+        function addChatMessage(sender, message, timestamp, isHost) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `chat-message ${isHost ? 'host-message' : 'guest-message'}`;
+            messageDiv.innerHTML = `
+                <div class="flex justify-between items-baseline">
+                    <span class="message-sender">${sender}</span>
+                    <span class="message-time">${timestamp}</span>
+                </div>
+                <div class="message-text">${message}</div>
+            `;
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        // --- Participant Management ---
+        function updateParticipantsDisplay(host, guests) {
+            participantsList.innerHTML = '';
+            
+            // Add host
+            const hostBadge = document.createElement('span');
+            hostBadge.className = 'participant-badge host-badge';
+            hostBadge.innerHTML = `<i class="fas fa-crown mr-1"></i>${host.name}`;
+            participantsList.appendChild(hostBadge);
+            
+            // Add guests
+            guests.forEach(guest => {
+                const guestBadge = document.createElement('span');
+                guestBadge.className = 'participant-badge';
+                guestBadge.textContent = guest.name;
+                participantsList.appendChild(guestBadge);
+            });
+        }
+
         // --- Jam Session Functions ---
         async function startJamSession() {
+            username = prompt("Enter your name to host the jam session:", "Host") || "Host";
+            if (!username) return;
+            
             try {
-                const response = await fetch('/create-jam');
+                const response = await fetch(`/create-jam?name=${encodeURIComponent(username)}`);
                 if (!response.ok) throw new Error('Failed to create jam session');
                 const data = await response.json();
                 jamId = data.jam_id;
@@ -593,6 +793,8 @@ frontend_html = """<!DOCTYPE html>
                 
                 // Show host controls
                 jamHostControls.classList.remove('hidden');
+                participantsContainer.classList.remove('hidden');
+                chatSection.classList.remove('hidden');
                 jamLinkInput.value = `${window.location.origin}/?jam=${jamId}`;
                 
                 isHost = true;
@@ -632,12 +834,17 @@ frontend_html = """<!DOCTYPE html>
             
             jamHostControls.classList.add('hidden');
             jamGuestInfo.classList.add('hidden');
+            participantsContainer.classList.add('hidden');
+            chatSection.classList.add('hidden');
             
             isHost = false;
             jamId = null;
         }
 
         function joinJamSession(jamIdToJoin) {
+            username = prompt("Enter your name to join the jam session:", "Guest") || "Guest";
+            if (!username) return;
+            
             jamId = jamIdToJoin;
             connectWebSocket(false);
             
@@ -650,16 +857,19 @@ frontend_html = """<!DOCTYPE html>
             jamStatusIndicatorSolid.classList.add('bg-blue-500');
             
             jamGuestInfo.classList.remove('hidden');
+            participantsContainer.classList.remove('hidden');
+            chatSection.classList.remove('hidden');
         }
 
         function connectWebSocket(asHost) {
             const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-            const wsUrl = `${protocol}${window.location.host}/ws/jam/${jamId}`;
+            const wsUrl = `${protocol}${window.location.host}/ws/jam/${jamId}?username=${encodeURIComponent(username)}`;
             
             jamSocket = new WebSocket(wsUrl);
-            
+            jamSocket.binaryType = "arraybuffer"; // <-- Add this line
+
             jamSocket.onopen = () => {
-                console.log("WebSocket connected");
+                console.log("WebSocket connected as", username);
                 if (asHost) {
                     // Send initial state if we have a current song
                     if (audioPlayer.currentSong) {
@@ -681,6 +891,9 @@ frontend_html = """<!DOCTYPE html>
                                 return;
                             }
                             
+                            // Update participants display
+                            updateParticipantsDisplay(data.host, data.guests);
+                            
                             // Update playlist
                             if (data.playlist && data.playlist.length > 0) {
                                 currentPlaylist = data.playlist;
@@ -699,49 +912,81 @@ frontend_html = """<!DOCTYPE html>
                 }
             };
             
-            jamSocket.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                
-                if (data.type === "sync") {
-                    // Sync with host's playback
-                    if (!isHost) {
-                        if (data.song && (!audioPlayer.currentSong || data.song.id !== audioPlayer.currentSong.id)) {
-                            playSong(data.song, data.position);
+            jamSocket.onmessage = async (event) => {
+                let data;
+                try {
+                    if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+                        // Handle compressed binary data
+                        let arrayBuffer;
+                        if (event.data instanceof Blob) {
+                            arrayBuffer = await event.data.arrayBuffer();
+                        } else {
+                            arrayBuffer = event.data;
                         }
-                        
-                        if (data.is_playing !== isPlaying) {
-                            if (data.is_playing) {
-                                audioPlayer.play().catch(console.error);
-                                playPauseIcon.classList.remove('fa-play');
-                                playPauseIcon.classList.add('fa-pause');
-                                isPlaying = true;
-                            } else {
-                                audioPlayer.pause();
-                                playPauseIcon.classList.remove('fa-pause');
-                                playPauseIcon.classList.add('fa-play');
-                                isPlaying = false;
+                        const decompressed = new TextDecoder().decode(pako.inflate(new Uint8Array(arrayBuffer)));
+                        data = JSON.parse(decompressed);
+                    } else if (typeof event.data === "string") {
+                        // Handle plain JSON string
+                        data = JSON.parse(event.data);
+                    } else {
+                        console.warn("Unknown WebSocket message type", event.data);
+                        return;
+                    }
+
+                    if (data.type === "sync") {
+                        // Sync with host's playback
+                        if (!isHost) {
+                            if (data.song && (!audioPlayer.currentSong || data.song.id !== audioPlayer.currentSong.id)) {
+                                playSong(data.song, data.position);
+                            }
+                            
+                            if (data.is_playing !== isPlaying) {
+                                if (data.is_playing) {
+                                    audioPlayer.play().catch(console.error);
+                                    playPauseIcon.classList.remove('fa-play');
+                                    playPauseIcon.classList.add('fa-pause');
+                                    isPlaying = true;
+                                } else {
+                                    audioPlayer.pause();
+                                    playPauseIcon.classList.remove('fa-pause');
+                                    playPauseIcon.classList.add('fa-play');
+                                    isPlaying = false;
+                                }
+                            }
+                            
+                            if (Math.abs(audioPlayer.currentTime - data.position) > 1) {
+                                audioPlayer.currentTime = data.position;
                             }
                         }
-                        
-                        if (Math.abs(audioPlayer.currentTime - data.position) > 1) {
-                            audioPlayer.currentTime = data.position;
+                    }
+                    else if (data.type === "song_change") {
+                        if (!isHost) {
+                            playSong(data.song, data.position);
                         }
                     }
-                }
-                else if (data.type === "song_change") {
-                    if (!isHost) {
-                        playSong(data.song, data.position);
+                    else if (data.type === "playlist_update") {
+                        if (!isHost && data.playlist) {
+                            currentPlaylist = data.playlist;
+                            renderPlaylist();
+                        }
                     }
-                }
-                else if (data.type === "playlist_update") {
-                    if (!isHost && data.playlist) {
-                        currentPlaylist = data.playlist;
-                        renderPlaylist();
+                    else if (data.type === "participants_update") {
+                        updateParticipantsDisplay(data.host, data.guests);
                     }
-                }
-                else if (data.type === "jam_ended") {
-                    alert("Host has ended the jam session");
-                    endJamSession();
+                    else if (data.type === "chat_message") {
+                        addChatMessage(
+                            data.sender, 
+                            data.message, 
+                            data.timestamp,
+                            data.is_host
+                        );
+                    }
+                    else if (data.type === "jam_ended") {
+                        alert(data.reason || "Host has ended the jam session");
+                        endJamSession();
+                    }
+                } catch (error) {
+                    console.error("Error processing WebSocket message:", error);
                 }
             };
             
@@ -1021,6 +1266,24 @@ frontend_html = """<!DOCTYPE html>
                 (song.artist && song.artist.toLowerCase().includes(searchTerm))
             );
             renderHostedSearchResults(filteredSongs);
+        });
+
+        // Chat event listener
+        sendChatButton.addEventListener('click', () => {
+            const message = chatInput.value.trim();
+            if (message && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+                jamSocket.send(JSON.stringify({
+                    type: "chat_message",
+                    message: message
+                }));
+                chatInput.value = '';
+            }
+        });
+
+        chatInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendChatButton.click();
+            }
         });
 
         // Jam Session Toggle
