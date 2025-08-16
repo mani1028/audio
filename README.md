@@ -101,5 +101,5 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 ## 📧 Contact
 
-Your Name - your.email@example.com  
-Project Link: [https://github.com/yourusername/jamsync](https://github.com/yourusername/jamsync)
+Your Name - chelamalla.manikanta28@gmail.com  
+Project Link: [https://github.com/mani1028/audio](https://github.com/mani1028/audio)
