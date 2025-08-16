@@ -1,0 +1,46 @@
+Portfolio Description: Real-Time Collaborative Music Player
+Project Name: JamSync - Collaborative Music Player
+Project Type: Full-Stack Web Application
+Key Features:
+
+Real-time synchronized music playback for multiple users
+
+Host/Guest architecture with playlist management
+
+Live chat functionality during sessions
+
+Responsive UI with modern design
+
+Tech Stack:
+
+Frontend: HTML5, CSS3, JavaScript, Tailwind CSS
+
+Backend: Python, FastAPI
+
+Real-Time Communication: WebSockets with zlib compression
+
+Audio Handling: HTML5 Audio API
+
+Deployment: Uvicorn ASGI server
+
+Dependencies: Pako.js (zlib), Font Awesome, Google Fonts
+
+Key Achievements:
+
+Implemented sub-second synchronization accuracy between host and guests
+
+Developed custom compression algorithm for WebSocket messages
+
+Created intuitive UI with real-time participant tracking
+
+Solved complex state management challenges for collaborative playback
+
+Challenges Overcome:
+
+WebSocket binary message handling
+
+Audio synchronization across different network conditions
+
+Participant management and session recovery
+
+Cross-browser compatibility for Web Audio API
