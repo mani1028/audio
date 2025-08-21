@@ -1815,10 +1815,6 @@ frontend_html = """
                     e.target.textContent = 'Added';
                     e.target.disabled = true;
                     e.target.classList.remove('bg-indigo-500', 'hover:bg-indigo-600');
-                    e.target.classList.add('bg-gray
-                    e.target.textContent = 'Added';
-                    e.target.disabled = true;
-                    e.target.classList.remove('bg-indigo-500', 'hover:bg-indigo-600');
                     e.target.classList.add('bg-gray-400', 'cursor-not-allowed');
                 }
             });
