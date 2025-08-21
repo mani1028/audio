@@ -1,4 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-socketio
 yt-dlp
+pyyaml
