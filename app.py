@@ -349,19 +349,17 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
             is_host = True
             logger.info(f"Host connected: {username} to jam {jam_id}")
         else:
-            # Check if username is already taken by host or other guests
             all_names = [g["name"] for g in jam["guests"]] + [jam["host"]["name"]]
             if username in all_names:
                 await websocket.close(code=1008, reason="Username already taken")
                 return
-                
             guest = {"ws": websocket, "name": username, "join_time": datetime.now().strftime("%H:%M:%S"), "last_heartbeat": time.time()}
             jam["guests"].append(guest)
             logger.info(f"Guest connected: {username} to jam {jam_id}")
 
         jam["last_heartbeat"] = time.time()
 
-        # send initial sync to the connecting socket (compressed)
+        # Always send initial sync with playlist and current song
         await send_compressed(websocket, {
             "type": "initial_sync",
             "current_song": jam.get("current_song"),
@@ -383,21 +381,17 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
             try:
                 text = await asyncio.wait_for(websocket.receive_text(), timeout=30)
             except asyncio.TimeoutError:
-                # keepalive ping; if this fails, socket likely closed
                 try:
                     await websocket.send_json({"type": "heartbeat"})
                 except Exception:
                     raise WebSocketDisconnect()
                 continue
 
-            # parse incoming JSON
             try:
                 data = json.loads(text)
             except Exception:
-                # ignore malformed
                 continue
 
-            # update heartbeat timestamps
             jam["last_heartbeat"] = time.time()
             if not is_host:
                 for g in jam["guests"]:
@@ -407,8 +401,7 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
 
             typ = data.get("type")
 
-            # --- Refactored: Actions anyone can perform ---
-            # Throttle frequent updates
+            # --- Synchronize playlist and song for all clients ---
             if typ == "player_state_update":
                 nowt = time.time()
                 if nowt - jam.get("last_update_time", 0) < 0.05:
@@ -418,16 +411,16 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
                 jam["position"] = float(data.get("position", jam["position"] or 0.0))
                 if "volume" in data:
                     jam["volume"] = float(data.get("volume", jam.get("volume", 1.0)))
-                # Broadcast sync to others
                 await broadcast_to_all(jam_id, {
                     "type": "sync",
                     "song": jam.get("current_song"),
                     "is_playing": jam["is_playing"],
                     "position": jam["position"],
                     "volume": jam.get("volume", 1.0)
-                }, exclude_ws=websocket)
+                })  # <--- Remove exclude_ws
 
             elif typ == "song_change":
+                # Allow guests to change song
                 jam["current_song"] = data.get("song")
                 jam["is_playing"] = True
                 jam["position"] = 0.0
@@ -436,39 +429,68 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
                     "song": jam["current_song"],
                     "is_playing": True,
                     "position": 0.0
-                }, exclude_ws=websocket)
+                })  # <--- Remove exclude_ws
 
             elif typ == "playlist_update":
                 jam["playlist"] = data.get("playlist", jam.get("playlist", []))
-                await broadcast_to_all(jam_id, {"type": "playlist_update", "playlist": jam["playlist"]}, exclude_ws=websocket)
+                # If no current song and playlist is not empty, auto-load the first song
+                if not jam.get("current_song") and jam["playlist"]:
+                    jam["current_song"] = jam["playlist"][0]
+                    jam["is_playing"] = False
+                    jam["position"] = 0.0
+                    await broadcast_to_all(jam_id, {
+                        "type": "song_change",
+                        "song": jam["current_song"],
+                        "is_playing": False,
+                        "position": 0.0
+                    })  # <--- Remove exclude_ws
+                await broadcast_to_all(jam_id, {"type": "playlist_update", "playlist": jam["playlist"]})  # <--- Remove exclude_ws
 
             elif typ == "seek":
                 jam["position"] = float(data.get("position", jam.get("position", 0.0)))
-                await broadcast_to_all(jam_id, {"type": "seek", "position": jam["position"]}, exclude_ws=websocket)
+                await broadcast_to_all(jam_id, {"type": "seek", "position": jam["position"]})  # <--- Remove exclude_ws
 
             elif typ == "song_ended":
-                # Advance to next in playlist
+                # Remove finished song and add a new one if in rotation mode
                 if jam.get("playlist"):
                     current = jam.get("current_song")
                     next_index = 0
                     try:
                         idx = next((i for i, s in enumerate(jam["playlist"]) if s.get("id") == (current or {}).get("id")), -1)
                         if idx != -1:
-                            next_index = (idx + 1) % len(jam["playlist"])
-                        # If song not found, just play from the start
+                            # Remove the finished song
+                            jam["playlist"].pop(idx)
+                            # Add a new random song from hosted songs if available
+                            all_songs = load_songs()
+                            used_ids = {s["id"] for s in jam["playlist"]}
+                            available = [s for s in all_songs if s["id"] not in used_ids]
+                            if available:
+                                import random
+                                new_song = random.choice(available)
+                                jam["playlist"].append(new_song)
+                            next_index = idx % len(jam["playlist"]) if jam["playlist"] else 0
                     except Exception:
-                        next_index = 0 # Fallback
-                    
+                        next_index = 0
+
                     if jam["playlist"]:
                         next_song = jam["playlist"][next_index]
                         jam["current_song"] = next_song
                         jam["is_playing"] = True
                         jam["position"] = 0.0
-                        # Broadcast to everyone since the server is changing the song
                         await broadcast_to_all(jam_id, {
                             "type": "song_change",
                             "song": jam["current_song"],
                             "is_playing": jam["is_playing"],
+                            "position": 0.0
+                        })
+                    else:
+                        jam["current_song"] = None
+                        jam["is_playing"] = False
+                        jam["position"] = 0.0
+                        await broadcast_to_all(jam_id, {
+                            "type": "song_change",
+                            "song": None,
+                            "is_playing": False,
                             "position": 0.0
                         })
 
@@ -1528,7 +1550,6 @@ frontend_html = """
                     is_playing: data.is_playing,
                     position: data.position
                 });
-                
                 // Set initial position and volume
                 audioPlayer.onloadedmetadata = () => {
                     if (data.position > 0) audioPlayer.currentTime = data.position;
@@ -1562,6 +1583,12 @@ frontend_html = """
             
             const currentSongId = audioPlayer.currentSong ? audioPlayer.currentSong.id : null;
             currentSongIndex = currentSongId ? currentPlaylist.findIndex(s => s.id === currentSongId) : -1;
+
+            // Auto-load first song if no song is loaded
+            if (currentSongIndex === -1 && currentPlaylist.length > 0) {
+                currentSongIndex = 0;
+                playSong(currentPlaylist[0]);
+            }
 
             currentPlaylist.forEach((song, idx) => {
                 const li = document.createElement('li');
