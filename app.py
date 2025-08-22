@@ -1259,7 +1259,7 @@ frontend_html = """
         // --- Jam Session Functions ---
         async function startJamSession() {
             username = prompt("Enter your name to host the jam session (3-20 characters):", "Host") || "Host";
-            if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9\s_-]+$/.test(username)) {
+            if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9\\s_-]+$/.test(username)) {
                 alert("Username must be 3-20 alphanumeric characters (spaces, hyphens, and underscores allowed).");
                 return;
             }
@@ -1303,7 +1303,7 @@ frontend_html = """
 
         function joinJamSession(jamIdToJoin) {
             username = prompt("Enter your name to join the jam session (3-20 characters):", "Guest") || "Guest";
-            if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9\s_-]+$/.test(username)) {
+            if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9\\s_-]+$/.test(username)) {
                 alert("Username must be 3-20 alphanumeric characters (spaces, hyphens, and underscores allowed).");
                 return;
             }
@@ -1640,33 +1640,65 @@ frontend_html = """
                 resetPlayerUI(); 
                 return; 
             }
-            if(isRotationMode) {
-                 playNextAndRotate();
-            } else {
-                currentSongIndex = (currentSongIndex + 1) % currentPlaylist.length;
-                playSong(currentPlaylist[currentSongIndex]);
-                renderPlaylist();
+            // playNextSong is now only for sequential playback.
+            // Rotation mode is handled by playNextAndRotate directly.
+            isRotationMode = false;
+            currentSongIndex = (currentSongIndex + 1) % currentPlaylist.length;
+            playSong(currentPlaylist[currentSongIndex]);
+            renderPlaylist();
+        }
+        
+        // Renamed from original for clarity
+        function playRandomSongsAndBeginRotation() {
+            if (!hostedSongs.length) {
+                alert('No hosted songs available to start rotation.');
+                return;
             }
+            isRotationMode = true;
+            // Create a shuffled list of unique songs
+            const shuffled = [...hostedSongs].sort(() => 0.5 - Math.random());
+            currentPlaylist = shuffled.slice(0, Math.min(5, hostedSongs.length));
+            currentSongIndex = 0;
+            // Sync the new playlist with the jam session
+            syncPlaylistWithServer();
+            // Render the new playlist in the UI
+            renderPlaylist();
+            // Play the first song
+            playSong(currentPlaylist[currentSongIndex]);
         }
 
         function playNextAndRotate() {
-            if (!currentPlaylist.length) return resetPlayerUI();
-
-            const lastPlayedIndex = currentSongIndex;
-            currentPlaylist.splice(lastPlayedIndex, 1);
-
-            const availableSongs = hostedSongs.filter(song => !currentPlaylist.some(pSong => pSong.id === song.id));
-            if (availableSongs.length > 0) {
-                const newSong = availableSongs[Math.floor(Math.random() * availableSongs.length)];
-                currentPlaylist.push(newSong);
+            if (!currentPlaylist.length || !hostedSongs.length) {
+                return resetPlayerUI();
             }
 
-            if (currentPlaylist.length === 0) return resetPlayerUI();
+            const lastPlayedIndex = currentSongIndex;
+            
+            // Remove the song that just finished.
+            currentPlaylist.splice(lastPlayedIndex, 1);
 
+            // Find a new song that isn't already in the playlist.
+            const availableSongs = hostedSongs.filter(song => 
+                !currentPlaylist.some(pSong => pSong.id === song.id)
+            );
+
+            if (availableSongs.length > 0) {
+                const newSong = availableSongs[Math.floor(Math.random() * availableSongs.length)];
+                currentPlaylist.push(newSong); // Add the new song to the end.
+            }
+
+            if (currentPlaylist.length === 0) {
+                return resetPlayerUI();
+            }
+
+            // The next song is at the same index as the one just removed.
+            // If the last song was removed, wrap around to the beginning.
             currentSongIndex = (lastPlayedIndex >= currentPlaylist.length) ? 0 : lastPlayedIndex;
-            playSong(currentPlaylist[currentSongIndex]);
-            renderPlaylist();
+            
+            // IMPORTANT: Sync playlist FIRST, then send the song change command.
             syncPlaylistWithServer();
+            playSong(currentPlaylist[currentSongIndex]);
+            renderPlaylist(); // Update UI to show new playlist
         }
         
         function resetPlayerUI() {
@@ -1881,40 +1913,36 @@ frontend_html = """
             }
         }
 
-        function playRandomSongsWithRotation() {
-            if (!hostedSongs.length) return alert('No hosted songs available.');
-            
-            isRotationMode = true;
-            const shuffled = [...hostedSongs].sort(() => 0.5 - Math.random());
-            currentPlaylist = shuffled.slice(0, Math.min(5, hostedSongs.length));
-            currentSongIndex = 0;
-            renderPlaylist();
-            syncPlaylistWithServer();
-            playSong(currentPlaylist[currentSongIndex]);
-        }
-
         // --- Event listeners ---
         playPauseButton.addEventListener('click', togglePlayPause);
         audioPlayer.addEventListener('timeupdate', updateProgressBar);
         
+        // --- IMPROVEMENT 1 & 2: REVISED 'ended' EVENT LOGIC ---
         audioPlayer.addEventListener('ended', () => {
             if (autoplayEnabled && currentPlaylist.length > 0) {
-                 if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                    // In a jam, only one client (usually the first to finish) should send this.
-                    // The server will handle advancing the playlist for everyone.
+                // If in rotation mode, the client is the source of truth for the next song.
+                // This applies whether in a jam session or not, ensuring the rotation
+                // logic (remove-and-add) is executed and synced.
+                if (isRotationMode) {
+                    playNextAndRotate();
+                }
+                // If in a jam (but not rotation), let the server dictate the next song
+                // to keep all clients in sync with a simple sequential playlist.
+                else if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
                     jamSocket.send(JSON.stringify({ type: 'song_ended' }));
-                } else if (!jamId) {
-                    // Solo mode
-                    playNextSong();
+                }
+                // If playing solo (not in a jam, not in rotation)
+                else if (!jamId) {
+                    playNextSong(); // This will call the normal sequential next song logic
                 }
             } else {
+                // If autoplay is off or playlist is empty, just pause.
                 pauseSong();
             }
         });
 
         audioPlayer.addEventListener('volumechange', () => {
             volumeBar.style.setProperty('--volume', audioPlayer.volume * 100 + '%');
-            // Volume changes are local unless the user is the host and explicitly syncs
         });
 
         progressBar.addEventListener('mousedown', () => { isSeeking = true; });
@@ -1935,7 +1963,14 @@ frontend_html = """
 
         volumeBar.addEventListener('input', (e) => audioPlayer.volume = e.target.value / 100);
 
-        nextButton.addEventListener('click', playNextSong);
+        nextButton.addEventListener('click', () => {
+            if (!currentPlaylist.length) return;
+            if (isRotationMode) {
+                playNextAndRotate();
+            } else {
+                playNextSong();
+            }
+        });
         autoplayToggle.addEventListener('click', toggleAutoplay);
         rewindButton.addEventListener('click', () => {
             const newTime = Math.max(0, audioPlayer.currentTime - 10);
@@ -1948,7 +1983,7 @@ frontend_html = """
             if (jamId) jamSocket.send(JSON.stringify({ type: 'seek', position: newTime }));
         });
 
-        playRandomHostedSongsButton.addEventListener('click', playRandomSongsWithRotation);
+        playRandomHostedSongsButton.addEventListener('click', playRandomSongsAndBeginRotation);
         showAddOptionsButton.addEventListener('click', openUnifiedSearchModal);
 
         // Unified search event listeners
