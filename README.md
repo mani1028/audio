@@ -5,7 +5,7 @@
 [![WebSocket](https://img.shields.io/badge/WebSocket-Enabled-brightgreen.svg)](https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API)
 
 ## 🚀 Live Demo
-Check out JamSync in action: [Live Music Player](https://your-deployed-url.com)
+Check out JamSync in action: [Live Music Player](https://jam1.onrender.com)
 
 ![App Screenshot](Screenshot.jpeg)
 
