@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     # Shutdown would go here
 
 # Create app WITH lifespan
-app = FastAPI(title="Synchronous Music Player (fixed)", lifespan=lifespan)
+app = FastAPI(title="Synq Music Player", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,7 +55,7 @@ YDL_OPTS = {
     # Use these options for better audio stability
     'extract_flat': False,
     'nocheckcertificate': True,
-    'ignoreerrors': False,
+    'ignoreerrors': True,  # Changed to True to continue on errors
     'logtostderr': False,
     'prefer_ffmpeg': True,
     'geo_bypass': True,
@@ -191,6 +191,7 @@ async def youtube_search(query: str = Query(..., min_length=1)):
             'extract_flat': True,
             'skip_download': True,
             'default_search': 'ytsearch',
+            'ignoreerrors': True,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(f"ytsearch10:{query}", download=False)
@@ -225,11 +226,12 @@ async def youtube_stream(video_id: str):
             'no_warnings': True,
             'source_address': '0.0.0.0',
             'nocheckcertificate': True,
-            'ignoreerrors': False,
+            'ignoreerrors': True,  # Changed to True to continue on errors
             'logtostderr': False,
             'prefer_ffmpeg': True,
             'geo_bypass': True,
             'geo_bypass_country': 'US',
+            'extract_flat': False,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts_alt) as ydl:
@@ -347,8 +349,9 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
             is_host = True
             logger.info(f"Host connected: {username} to jam {jam_id}")
         else:
-            # Check if username is already taken
-            if any(g["name"] == username for g in jam["guests"]):
+            # Check if username is already taken by host or other guests
+            all_names = [g["name"] for g in jam["guests"]] + [jam["host"]["name"]]
+            if username in all_names:
                 await websocket.close(code=1008, reason="Username already taken")
                 return
                 
@@ -395,9 +398,8 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
                 continue
 
             # update heartbeat timestamps
-            if is_host:
-                jam["last_heartbeat"] = time.time()
-            else:
+            jam["last_heartbeat"] = time.time()
+            if not is_host:
                 for g in jam["guests"]:
                     if g["ws"] == websocket:
                         g["last_heartbeat"] = time.time()
@@ -405,107 +407,109 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
 
             typ = data.get("type")
 
-            # Host-only actions
-            if is_host:
-                # Throttle frequent updates
-                if typ == "host_update":
-                    nowt = time.time()
-                    if nowt - jam.get("last_update_time", 0) < 0.05:
-                        continue
-                    jam["last_update_time"] = nowt
-                    jam["is_playing"] = data.get("is_playing", jam["is_playing"])
-                    jam["position"] = float(data.get("position", jam["position"] or 0.0))
-                    if "volume" in data:
-                        jam["volume"] = float(data.get("volume", jam.get("volume", 1.0)))
-                    # broadcast sync to guests
-                    await broadcast_to_guests(jam_id, {
-                        "type": "sync",
-                        "song": jam.get("current_song"),
-                        "is_playing": jam["is_playing"],
-                        "position": jam["position"],
-                        "volume": jam.get("volume", 1.0)
-                    })
-
-                elif typ == "host_init":
-                    jam["current_song"] = data.get("song")
-                    jam["playlist"] = data.get("playlist", jam.get("playlist", []))
-                    jam["is_playing"] = data.get("is_playing", False)
-                    jam["position"] = float(data.get("position", 0.0))
+            # --- Refactored: Actions anyone can perform ---
+            # Throttle frequent updates
+            if typ == "player_state_update":
+                nowt = time.time()
+                if nowt - jam.get("last_update_time", 0) < 0.05:
+                    continue
+                jam["last_update_time"] = nowt
+                jam["is_playing"] = data.get("is_playing", jam["is_playing"])
+                jam["position"] = float(data.get("position", jam["position"] or 0.0))
+                if "volume" in data:
                     jam["volume"] = float(data.get("volume", jam.get("volume", 1.0)))
-                    await broadcast_participants_update(jam_id)
+                # Broadcast sync to others
+                await broadcast_to_all(jam_id, {
+                    "type": "sync",
+                    "song": jam.get("current_song"),
+                    "is_playing": jam["is_playing"],
+                    "position": jam["position"],
+                    "volume": jam.get("volume", 1.0)
+                }, exclude_ws=websocket)
 
-                elif typ == "song_change":
-                    jam["current_song"] = data.get("song")
-                    jam["is_playing"] = True
-                    jam["position"] = 0.0
-                    await broadcast_to_guests(jam_id, {
-                        "type": "song_change",
-                        "song": jam["current_song"],
-                        "is_playing": True,
-                        "position": 0.0
-                    })
+            elif typ == "song_change":
+                jam["current_song"] = data.get("song")
+                jam["is_playing"] = True
+                jam["position"] = 0.0
+                await broadcast_to_all(jam_id, {
+                    "type": "song_change",
+                    "song": jam["current_song"],
+                    "is_playing": True,
+                    "position": 0.0
+                }, exclude_ws=websocket)
 
-                elif typ == "playlist_update":
-                    jam["playlist"] = data.get("playlist", jam.get("playlist", []))
-                    await broadcast_to_guests(jam_id, {"type": "playlist_update", "playlist": jam["playlist"]})
+            elif typ == "playlist_update":
+                jam["playlist"] = data.get("playlist", jam.get("playlist", []))
+                await broadcast_to_all(jam_id, {"type": "playlist_update", "playlist": jam["playlist"]}, exclude_ws=websocket)
 
-                elif typ == "chat_message":
-                    msg = data.get("message", "")
-                    if validate_message(msg):
-                        await broadcast_chat_message(jam_id, {
-                            "sender": username,
-                            "message": msg,
-                            "timestamp": datetime.now().strftime("%H:%M")
-                        })
+            elif typ == "seek":
+                jam["position"] = float(data.get("position", jam.get("position", 0.0)))
+                await broadcast_to_all(jam_id, {"type": "seek", "position": jam["position"]}, exclude_ws=websocket)
 
-                elif typ == "sync_request":
-                    # host should not request sync from server normally, ignore
-                    pass
-
-                elif typ == "host_seek":
-                    jam["position"] = float(data.get("position", jam.get("position", 0.0)))
-                    await broadcast_to_guests(jam_id, {"type": "seek", "position": jam["position"]})
-
-                elif typ == "host_ended":
-                    # advance to next in playlist
-                    if jam.get("playlist"):
-                        current = jam.get("current_song")
-                        next_index = 0
-                        try:
-                            idx = next((i for i, s in enumerate(jam["playlist"]) if s.get("id") == (current or {}).get("id")), None)
-                            if idx is not None:
-                                next_index = (idx + 1) % len(jam["playlist"])
-                        except Exception:
-                            next_index = 0
-                        next_song = jam["playlist"][next_index] if jam["playlist"] else None
+            elif typ == "song_ended":
+                # Advance to next in playlist
+                if jam.get("playlist"):
+                    current = jam.get("current_song")
+                    next_index = 0
+                    try:
+                        idx = next((i for i, s in enumerate(jam["playlist"]) if s.get("id") == (current or {}).get("id")), -1)
+                        if idx != -1:
+                            next_index = (idx + 1) % len(jam["playlist"])
+                        # If song not found, just play from the start
+                    except Exception:
+                        next_index = 0 # Fallback
+                    
+                    if jam["playlist"]:
+                        next_song = jam["playlist"][next_index]
                         jam["current_song"] = next_song
-                        jam["is_playing"] = bool(next_song)
+                        jam["is_playing"] = True
                         jam["position"] = 0.0
-                        await broadcast_to_guests(jam_id, {
+                        # Broadcast to everyone since the server is changing the song
+                        await broadcast_to_all(jam_id, {
                             "type": "song_change",
                             "song": jam["current_song"],
                             "is_playing": jam["is_playing"],
                             "position": 0.0
                         })
 
-            else:
-                # guest messages
-                if typ == "sync_request":
-                    await send_compressed(websocket, {
-                        "type": "sync",
-                        "song": jam.get("current_song"),
-                        "is_playing": jam.get("is_playing", False),
-                        "position": jam.get("position", 0.0),
-                        "volume": jam.get("volume", 1.0)
+            elif typ == "sync_request":
+                # A client is asking for the current state
+                await send_compressed(websocket, {
+                    "type": "sync",
+                    "song": jam.get("current_song"),
+                    "is_playing": jam.get("is_playing", False),
+                    "position": jam.get("position", 0.0),
+                    "volume": jam.get("volume", 1.0)
+                })
+
+            elif typ == "chat_message":
+                msg = data.get("message", "")
+                if validate_message(msg):
+                    await broadcast_chat_message(jam_id, {
+                        "sender": username,
+                        "message": msg,
+                        "timestamp": datetime.now().strftime("%H:%M")
                     })
-                elif typ == "chat_message":
-                    msg = data.get("message", "")
-                    if validate_message(msg):
-                        await broadcast_chat_message(jam_id, {
-                            "sender": username,
-                            "message": msg,
-                            "timestamp": datetime.now().strftime("%H:%M")
-                        })
+            
+            # This is sent by the host upon reconnecting to sync the session
+            elif is_host and typ == "host_init":
+                jam["current_song"] = data.get("song")
+                jam["playlist"] = data.get("playlist", jam.get("playlist", []))
+                jam["is_playing"] = data.get("is_playing", False)
+                jam["position"] = float(data.get("position", 0.0))
+                jam["volume"] = float(data.get("volume", jam.get("volume", 1.0)))
+                # After host re-initializes, inform everyone of the state
+                await broadcast_to_all(jam_id, {
+                    "type": "initial_sync",
+                     "current_song": jam.get("current_song"),
+                    "playlist": jam.get("playlist", []),
+                    "is_playing": jam.get("is_playing", False),
+                    "position": jam.get("position", 0.0),
+                    "volume": jam.get("volume", 1.0),
+                    "host": {"name": jam.get("host", {}).get("name")},
+                    "guests": [{"name": g["name"], "join_time": g["join_time"]} for g in jam.get("guests", [])],
+                }, exclude_ws=websocket)
+
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {username} (host={is_host})")
@@ -513,16 +517,15 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
         if jam_id in active_jams:
             jam_local = active_jams[jam_id]
             if is_host:
-                # notify guests and close
-                await broadcast_to_guests(jam_id, {"type": "jam_ended", "reason": f"Host {jam_local.get('host', {}).get('name', 'Host')} left the session"})
-                # try to close guest sockets
+                # Host left, end the session for everyone
+                logger.info(f"Host {username} left jam {jam_id}. Terminating session.")
+                await broadcast_to_all(jam_id, {"type": "jam_ended", "reason": f"Host {jam_local.get('host', {}).get('name', 'Host')} left the session"})
                 for g in jam_local.get("guests", []):
-                    try:
-                        await g["ws"].close(code=1000, reason="Host disconnected")
-                    except Exception:
-                        pass
+                    try: await g["ws"].close(code=1000, reason="Host disconnected")
+                    except Exception: pass
                 active_jams.pop(jam_id, None)
             else:
+                # Guest left, update participant list for others
                 jam_local["guests"] = [g for g in jam_local.get("guests", []) if g["ws"] != websocket]
                 await broadcast_participants_update(jam_id)
     except Exception:
@@ -535,19 +538,34 @@ async def websocket_jam_endpoint(websocket: WebSocket, jam_id: str):
 # ----------------------------
 # Broadcast helpers
 # ----------------------------
-async def broadcast_to_guests(jam_id: str, message: dict):
+async def broadcast_to_all(jam_id: str, message: dict, exclude_ws: Optional[WebSocket] = None):
     if jam_id not in active_jams:
         return
     jam = active_jams[jam_id]
-    alive = []
-    for guest in jam.get("guests", []):
+    
+    # Send to host if they exist and are not excluded
+    host_ws = jam.get("host", {}).get("ws")
+    if host_ws and host_ws != exclude_ws:
         try:
-            await send_compressed(guest["ws"], message)
-            alive.append(guest)
+            await send_compressed(host_ws, message)
         except Exception:
-            # drop guest on failure
-            continue
-    jam["guests"] = alive
+            logger.debug(f"Failed to send to host of jam {jam_id}")
+
+    # Send to guests, tracking who is still connected
+    alive_guests = []
+    for guest in jam.get("guests", []):
+        guest_ws = guest.get("ws")
+        if guest_ws and guest_ws != exclude_ws:
+            try:
+                await send_compressed(guest_ws, message)
+                alive_guests.append(guest)
+            except Exception:
+                # Drop guest on failure
+                logger.debug(f"Dropping disconnected guest from jam {jam_id}")
+                continue
+        else:
+             alive_guests.append(guest) # Keep the excluded guest in the list
+    jam["guests"] = alive_guests
 
 async def broadcast_participants_update(jam_id: str):
     if jam_id not in active_jams:
@@ -558,13 +576,7 @@ async def broadcast_participants_update(jam_id: str):
         "host": {"name": jam.get("host", {}).get("name")},
         "guests": [{"name": g["name"], "join_time": g["join_time"]} for g in jam.get("guests", [])]
     }
-    # send to host (compressed)
-    try:
-        if jam.get("host") and jam["host"].get("ws"):
-            await send_compressed(jam["host"]["ws"], update)
-    except Exception:
-        pass
-    await broadcast_to_guests(jam_id, update)
+    await broadcast_to_all(jam_id, update)
 
 async def broadcast_chat_message(jam_id: str, message: dict):
     if jam_id not in active_jams:
@@ -577,13 +589,7 @@ async def broadcast_chat_message(jam_id: str, message: dict):
         "timestamp": message["timestamp"],
         "is_host": message["sender"] == jam.get("host", {}).get("name")
     }
-    # host
-    try:
-        if jam.get("host") and jam["host"].get("ws"):
-            await send_compressed(jam["host"]["ws"], chat)
-    except Exception:
-        pass
-    await broadcast_to_guests(jam_id, chat)
+    await broadcast_to_all(jam_id, chat)
 
 # ----------------------------
 # Cleanup task
@@ -594,22 +600,32 @@ async def cleanup_inactive_sessions():
         nowt = time.time()
         to_delete = []
         for jam_id, jam in list(active_jams.items()):
+            # A jam is inactive if the last heartbeat is older than 5 minutes
             if nowt - jam.get("last_heartbeat", 0) > 300:
                 to_delete.append(jam_id)
+        
         for j in to_delete:
             logger.info(f"Cleaning inactive jam {j}")
-            try:
-                for g in active_jams[j].get("guests", []):
-                    try:
-                        await g["ws"].close(code=1000, reason="Session timeout")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            jam_to_clean = active_jams.get(j)
+            if jam_to_clean:
+                # Notify and close all connections before deleting
+                await broadcast_to_all(j, {"type": "jam_ended", "reason": "Session timed out due to inactivity"})
+                
+                # Close host WebSocket
+                host_ws = jam_to_clean.get("host", {}).get("ws")
+                if host_ws:
+                    try: await host_ws.close(code=1000, reason="Session timeout")
+                    except Exception: pass
+                
+                # Close guest WebSockets
+                for g in jam_to_clean.get("guests", []):
+                    try: await g["ws"].close(code=1000, reason="Session timeout")
+                    except Exception: pass
+
             active_jams.pop(j, None)
 
 # ----------------------------
-# Frontend HTML (updated with YouTube integration and autoplay toggle)
+# Frontend HTML (updated with synchronization fixes)
 # ----------------------------
 frontend_html = """
 <!DOCTYPE html>
@@ -617,8 +633,7 @@ frontend_html = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="google-adsense-account" content="ca-pub-8346311897787343">
-    <title>Audio Player</title>
+    <title>Synq Music Player</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
     <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-8346311897787343"
@@ -760,14 +775,14 @@ frontend_html = """
             }
         }
     </style>
+
 </head>
 <body class="bg-gradient-to-br from-indigo-50 to-purple-100 min-h-screen flex justify-center items-center p-4 relative">
     <div class="audio-player-card bg-white shadow-xl rounded-2xl p-6 md:p-8 w-full max-w-sm border border-gray-100">
         <h2 class="text-2xl md:text-3xl font-extrabold text-center text-gray-800 mb-6 tracking-tight">
-            Music Player
+            Synq Player
         </h2>
         
-        <!-- Jam Session UI -->
         <div id="jam-container" class="mb-6 p-4 bg-gray-50 rounded-lg border border-gray-200">
             <div class="flex items-center justify-between mb-3">
                 <div class="flex items-center">
@@ -801,7 +816,7 @@ frontend_html = """
             </div>
             
             <div id="jam-guest-info" class="hidden">
-                <p class="text-xs text-gray-600">Connected to host's session</p>
+                <p class="text-xs text-gray-600">Connected to a shared session!</p>
             </div>
             
             <div id="participants-container" class="mt-3 hidden">
@@ -843,7 +858,6 @@ frontend_html = """
 
         <div class="flex items-center justify-center space-x-4 mb-6">
 
-            <!-- Autoplay Toggle Button -->
             <button id="autoplay-toggle" class="autoplay-toggle text-gray-700 hover:text-indigo-600 focus:outline-none transition-transform duration-200 ease-in-out active:scale-95" title="Toggle Autoplay">
                 <i class="fas fa-infinity"></i>
             </button>
@@ -894,7 +908,6 @@ frontend_html = """
         </ul>
     </div>
 
-    <!-- Unified Search Modal -->
     <div id="unified-search-modal" class="fixed top-0 left-0 w-full h-full bg-black bg-opacity-50 flex items-center justify-center hidden z-50">
         <div class="bg-white rounded-lg p-6 w-full max-w-md max-h-[80vh] overflow-hidden flex flex-col">
             <div class="flex justify-between items-center mb-4">
@@ -992,7 +1005,9 @@ frontend_html = """
         let maxReconnectAttempts = 5;
         let reconnectTimeout = null;
         let username = "Guest";
-        let autoplayEnabled = false; // Autoplay state
+        let autoplayEnabled = false;
+        let isRotationMode = false; // <-- New state for random rotation mode
+        let isSeeking = false; // Flag to prevent sending seek updates while user is dragging
 
         // --- Audio Player Logic ---
         function playSong(song, seekTime = 0) {
@@ -1001,52 +1016,87 @@ frontend_html = """
                 return;
             }
             
-            // Add cache busting parameter to prevent stale connections
-            let audioUrl = song.url;
-            if (song.source === 'youtube') {
-                if (audioUrl.includes('?')) {
-                    audioUrl += `&_=${Date.now()}`;
-                } else {
-                    audioUrl += `?_=${Date.now()}`;
-                }
+            // In a jam, send song change message to server, which will then broadcast
+            if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+                jamSocket.send(JSON.stringify({
+                    type: "song_change",
+                    song: song
+                }));
             }
             
+            // Reset the audio player completely first
+            audioPlayer.pause();
+            audioPlayer.src = '';
+            audioPlayer.load();
+            
+            // Add cache busting parameter to prevent stale connections
+            let audioUrl = song.url;
+            audioUrl += (audioUrl.includes('?') ? '&' : '?') + '_=' + Date.now();
+            
+            // Set up event listeners BEFORE setting the source
+            audioPlayer.onerror = (e) => {
+                console.error("Audio loading error:", e, audioUrl);
+                playPauseIcon.classList.remove('fa-pause');
+                playPauseIcon.classList.add('fa-play');
+                isPlaying = false;
+                
+                // For YouTube songs, try to refresh the stream URL
+                if (song.source === 'youtube') {
+                    console.log("Attempting to refresh YouTube stream URL...");
+                    const videoId = song.id.replace('yt_', '');
+                    refreshYouTubeStream(videoId)
+                        .then(refreshedSong => {
+                            if (refreshedSong) {
+                                // Update the song in playlist and try again
+                                const songIndex = currentPlaylist.findIndex(s => s.id === song.id);
+                                if (songIndex !== -1) {
+                                    currentPlaylist[songIndex] = refreshedSong;
+                                    syncPlaylistWithServer();
+                                    if (songIndex === currentSongIndex) {
+                                        playSong(refreshedSong, seekTime);
+                                    }
+                                }
+                            }
+                        })
+                        .catch(err => {
+                            console.error("Failed to refresh YouTube stream:", err);
+                            if (autoplayEnabled) setTimeout(() => playNextSong(), 1000);
+                        });
+                } else if (autoplayEnabled) {
+                    setTimeout(() => playNextSong(), 1000);
+                }
+            };
+
+            
+            audioPlayer.onloadedmetadata = () => {
+                console.log("Audio metadata loaded, duration:", audioPlayer.duration);
+                if (seekTime > 0 && !isNaN(audioPlayer.duration) && seekTime < audioPlayer.duration) {
+                    audioPlayer.currentTime = seekTime;
+                }
+                
+                // For guests, we wait for a 'sync' or 'song_change' message from the host to play.
+                // For hosts or solo players, we can play immediately.
+                if (!jamId || isHost) {
+                     audioPlayer.play().catch(error => {
+                        console.error("Error playing audio:", error);
+                        playPauseIcon.classList.remove('fa-pause');
+                        playPauseIcon.classList.add('fa-play');
+                        isPlaying = false;
+                    });
+                }
+                updateProgressBar();
+                updateTotalTime();
+            };
+            
+            // Now set the source and metadata
             audioPlayer.src = audioUrl;
             audioPlayer.currentSong = song;
             trackTitle.textContent = song.title;
             artistName.textContent = song.artist || 'Unknown Artist';
             albumArt.src = song.thumbnail || "https://placehold.co/128x128/4F46E5/FFFFFF?text=Album+Art";
-
+            
+            // Load the audio
             audioPlayer.load();
-            audioPlayer.onloadedmetadata = () => {
-                if (seekTime > 0 && !isNaN(audioPlayer.duration) && seekTime < audioPlayer.duration) {
-                    audioPlayer.currentTime = seekTime;
-                }
-                
-                if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                    // Broadcast song change to guests
-                    jamSocket.send(JSON.stringify({
-                        type: "song_change",
-                        song: song,
-                        is_playing: true,
-                        position: seekTime
-                    }));
-                }
-                
-                if (!isHost) {
-                    // Guests wait for host's play command
-                    return;
-                }
-                
-                audioPlayer.play().catch(error => {
-                    console.error("Error playing audio:", error);
-                    playPauseIcon.classList.remove('fa-pause');
-                    playPauseIcon.classList.add('fa-play');
-                    isPlaying = false;
-                });
-                updateProgressBar();
-                updateTotalTime();
-            };
 
             playPauseIcon.classList.remove('fa-play');
             playPauseIcon.classList.add('fa-pause');
@@ -1063,15 +1113,16 @@ frontend_html = """
             }
         }
 
+
         function pauseSong() {
             audioPlayer.pause();
             playPauseIcon.classList.remove('fa-pause');
             playPauseIcon.classList.add('fa-play');
             isPlaying = false;
             
-            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+            if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
                 jamSocket.send(JSON.stringify({
-                    type: "host_update",
+                    type: "player_state_update",
                     is_playing: false,
                     position: audioPlayer.currentTime,
                     volume: audioPlayer.volume
@@ -1080,46 +1131,34 @@ frontend_html = """
         }
 
         function togglePlayPause() {
-            if (audioPlayer.currentSong) {
-                if (isPlaying) {
-                    pauseSong();
-                } else {
-                    audioPlayer.play().catch(error => {
-                        console.error("Error resuming playback:", error);
-                        playPauseIcon.classList.remove('fa-pause');
-                        playPauseIcon.classList.add('fa-play');
-                        isPlaying = false;
-                    });
-                    playPauseIcon.classList.remove('fa-play');
-                    playPauseIcon.classList.add('fa-pause');
-                    isPlaying = true;
-                    
-                    if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                        jamSocket.send(JSON.stringify({
-                            type: "host_update",
-                            is_playing: true,
-                            position: audioPlayer.currentTime,
-                            volume: audioPlayer.volume
-                        }));
-                    }
+            if (!audioPlayer.currentSong) return;
+
+            if (isPlaying) {
+                pauseSong();
+            } else {
+                audioPlayer.play().catch(error => console.error("Error resuming playback:", error));
+                playPauseIcon.classList.remove('fa-play');
+                playPauseIcon.classList.add('fa-pause');
+                isPlaying = true;
+                
+                if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+                    jamSocket.send(JSON.stringify({
+                        type: "player_state_update",
+                        is_playing: true,
+                        position: audioPlayer.currentTime,
+                        volume: audioPlayer.volume
+                    }));
                 }
             }
         }
 
         function updateProgressBar() {
+            if (isSeeking) return; // Don't update UI if user is dragging the slider
             const dur = audioPlayer.duration || 0;
             const cur = audioPlayer.currentTime || 0;
             progressBar.value = dur ? (cur / dur) * 100 : 0;
-            progressBar.style.setProperty('--progress', `${progressBar.value}%`);
+            progressBar.style.setProperty('--progress', progressBar.value + '%');
             currentTimeSpan.textContent = formatTime(cur);
-            
-            // Sync with host every 5 seconds if guest
-            if (!isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN && Date.now() - lastSyncTime > 5000) {
-                lastSyncTime = Date.now();
-                jamSocket.send(JSON.stringify({
-                    type: "sync_request"
-                }));
-            }
         }
 
         function updateTotalTime() {
@@ -1130,7 +1169,7 @@ frontend_html = """
             if (!seconds || isNaN(seconds) || seconds < 0) return "0:00";
             const minutes = Math.floor(seconds / 60);
             const secs = Math.floor(seconds % 60);
-            return `${minutes}:${secs < 10 ? '0' : ''}${secs}`;
+            return minutes + ':' + (secs < 10 ? '0' : '') + secs;
         }
 
         // --- Autoplay Functions ---
@@ -1143,56 +1182,7 @@ frontend_html = """
                 autoplayToggle.classList.remove('active');
                 autoplayToggle.title = 'Autoplay: OFF';
             }
-            // Save to localStorage
             localStorage.setItem('autoplayEnabled', autoplayEnabled.toString());
-        }
-
-        function playNextSongAutoplay() {
-            if (!currentPlaylist.length) { 
-                resetPlayerUI(); 
-                return; 
-            }
-            
-            // Remove the current song
-            currentPlaylist.splice(currentSongIndex, 1);
-            
-            // Add a new random song if available and playlist < 10
-            if (hostedSongs.length > 0 && currentPlaylist.length < 10) {
-                const availableSongs = hostedSongs.filter(song =>
-                    !currentPlaylist.some(s => s.id === song.id)
-                );
-                if (availableSongs.length > 0) {
-                    const randomIndex = Math.floor(Math.random() * availableSongs.length);
-                    const newSong = availableSongs[randomIndex];
-                    currentPlaylist.push(newSong);
-                }
-            }
-            
-            // If playlist is empty, reset
-            if (currentPlaylist.length === 0) {
-                resetPlayerUI();
-                renderPlaylist();
-                syncPlaylistWithGuests();
-                return;
-            }
-            
-            // Adjust index if needed
-            if (currentSongIndex >= currentPlaylist.length) {
-                currentSongIndex = 0;
-            }
-            
-            playSong(currentPlaylist[currentSongIndex]);
-            renderPlaylist();
-            
-            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                jamSocket.send(JSON.stringify({ 
-                    type: 'host_update', 
-                    is_playing: true, 
-                    position: audioPlayer.currentTime, 
-                    volume: audioPlayer.volume 
-                }));
-                syncPlaylistWithGuests();
-            }
         }
 
         // --- Chat Functions ---
@@ -1215,10 +1205,12 @@ frontend_html = """
             participantsList.innerHTML = '';
             
             // Add host
-            const hostBadge = document.createElement('span');
-            hostBadge.className = 'participant-badge host-badge';
-            hostBadge.innerHTML = `<i class="fas fa-crown mr-1"></i>${host.name}`;
-            participantsList.appendChild(hostBadge);
+            if(host && host.name) {
+                const hostBadge = document.createElement('span');
+                hostBadge.className = 'participant-badge host-badge';
+                hostBadge.innerHTML = `<i class="fas fa-crown mr-1"></i>${host.name}`;
+                participantsList.appendChild(hostBadge);
+            }
             
             // Add guests
             (guests || []).forEach(guest => {
@@ -1245,7 +1237,7 @@ frontend_html = """
             const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
             reconnectAttempts++;
             reconnectTimeout = setTimeout(() => {
-                connectWebSocket(isHost);
+                connectWebSocket();
             }, delay);
         }
 
@@ -1266,8 +1258,8 @@ frontend_html = """
 
         // --- Jam Session Functions ---
         async function startJamSession() {
-            username = prompt("Enter your name to host the jam session (3-20 alphanumeric characters):", "Host") || "Host";
-            if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9 _-]+$/.test(username)) {
+            username = prompt("Enter your name to host the jam session (3-20 characters):", "Host") || "Host";
+            if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9\s_-]+$/.test(username)) {
                 alert("Username must be 3-20 alphanumeric characters (spaces, hyphens, and underscores allowed).");
                 return;
             }
@@ -1277,32 +1269,7 @@ frontend_html = """
                 const data = await response.json();
                 jamId = data.jam_id;
                 isHost = true;
-                connectWebSocket(true);
-                jamToggle.textContent = 'End Jam';
-                jamStatusText.textContent = 'Jam Mode: Hosting';
-                jamStatusIndicator.classList.remove('bg-gray-400');
-                jamStatusIndicator.classList.add('bg-green-400');
-                jamStatusIndicatorSolid.classList.remove('bg-gray-500');
-                jamStatusIndicatorSolid.classList.add('bg-green-500');
-                jamHostControls.classList.remove('hidden');
-                participantsContainer.classList.remove('hidden');
-                chatSection.classList.remove('hidden');
-                jamLinkInput.value = `${window.location.origin}/?jam=${jamId}`;
-                reconnectAttempts = 0;
-
-                clearInterval(syncInterval);
-                syncInterval = setInterval(() => {
-                    if (isPlaying && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                        jamSocket.send(JSON.stringify({
-                            type: "host_update",
-                            is_playing: true,
-                            position: audioPlayer.currentTime,
-                            volume: audioPlayer.volume
-                        }));
-                    }
-                }, 5000);
-
-                startHeartbeat();
+                connectWebSocket();
             } catch (err) {
                 console.error("Failed to start jam:", err);
                 alert("Failed to start jam session.");
@@ -1311,7 +1278,7 @@ frontend_html = """
 
         function endJamSession() {
             if (jamSocket) {
-                try { jamSocket.close(); } catch (e) {}
+                try { jamSocket.close(1000); } catch (e) {}
                 jamSocket = null;
             }
             clearInterval(syncInterval);
@@ -1331,32 +1298,23 @@ frontend_html = """
             isHost = false;
             jamId = null;
             reconnectAttempts = 0;
+            isRotationMode = false;
         }
 
         function joinJamSession(jamIdToJoin) {
-            username = prompt("Enter your name to join the jam session (3-20 alphanumeric characters):", "Guest") || "Guest";
-            if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9 _-]+$/.test(username)) {
+            username = prompt("Enter your name to join the jam session (3-20 characters):", "Guest") || "Guest";
+            if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9\s_-]+$/.test(username)) {
                 alert("Username must be 3-20 alphanumeric characters (spaces, hyphens, and underscores allowed).");
                 return;
             }
             jamId = jamIdToJoin;
             isHost = false;
-            connectWebSocket(false);
-            jamToggle.textContent = 'Leave Jam';
-            jamStatusText.textContent = 'Jam Mode: Connected';
-            jamStatusIndicator.classList.remove('bg-gray-400');
-            jamStatusIndicator.classList.add('bg-blue-400');
-            jamStatusIndicatorSolid.classList.remove('bg-gray-500');
-            jamStatusIndicatorSolid.classList.add('bg-blue-500');
-            jamGuestInfo.classList.remove('hidden');
-            participantsContainer.classList.remove('hidden');
-            chatSection.classList.remove('hidden');
-            reconnectAttempts = 0;
+            connectWebSocket();
         }
 
-        function connectWebSocket(asHost) {
+        function connectWebSocket() {
             if (!jamId) {
-                alert("No jam id set");
+                console.error("connectWebSocket called without a jamId.");
                 return;
             }
             const proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
@@ -1374,8 +1332,9 @@ frontend_html = """
                 console.log("WebSocket open as", username);
                 reconnectContainer.classList.add('hidden');
                 reconnectAttempts = 0;
-                if (asHost && audioPlayer.currentSong) {
-                    jamSocket.send(JSON.stringify({
+                if (isHost) {
+                    // Send initial state to the server
+                     jamSocket.send(JSON.stringify({
                         type: "host_init",
                         song: audioPlayer.currentSong,
                         playlist: currentPlaylist,
@@ -1385,148 +1344,224 @@ frontend_html = """
                     }));
                 }
                 startHeartbeat();
+
+                // Set up UI for jam session
+                jamToggle.textContent = 'Leave Jam';
+                jamStatusText.textContent = isHost ? 'Jam Mode: Hosting' : 'Jam Mode: Connected';
+                jamStatusIndicator.classList.remove('bg-gray-400');
+                jamStatusIndicator.classList.add(isHost ? 'bg-green-400' : 'bg-blue-400');
+                jamStatusIndicatorSolid.classList.remove('bg-gray-500');
+                jamStatusIndicatorSolid.classList.add(isHost ? 'bg-green-500' : 'bg-blue-500');
+                if(isHost) jamHostControls.classList.remove('hidden');
+                else jamGuestInfo.classList.remove('hidden');
+                participantsContainer.classList.remove('hidden');
+                chatSection.classList.remove('hidden');
+                jamLinkInput.value = `${window.location.origin}/?jam=${jamId}`;
             };
 
             jamSocket.onmessage = async (ev) => {
                 let data = null;
                 try {
                     if (ev.data instanceof ArrayBuffer) {
-                        // Try decompress with pako (client includes pako)
-                        try {
-                            const inflated = pako.inflate(new Uint8Array(ev.data));
-                            const text = new TextDecoder().decode(inflated);
-                            data = JSON.parse(text);
-                        } catch (e) {
-                            // fallback: try parse as text
-                            const text = new TextDecoder().decode(new Uint8Array(ev.data));
-                            data = JSON.parse(text);
-                        }
+                        const inflated = pako.inflate(new Uint8Array(ev.data));
+                        const text = new TextDecoder().decode(inflated);
+                        data = JSON.parse(text);
                     } else if (typeof ev.data === 'string') {
                         data = JSON.parse(ev.data);
                     } else {
                         return;
                     }
                 } catch (err) {
-                    console.error("WS parse error", err);
+                    console.error("WS parse error", err, ev.data);
                     return;
                 }
 
-                // Handle messages
                 if (!data || !data.type) return;
-                if (data.type === 'heartbeat') {
-                    jamSocket.send(JSON.stringify({ type: 'heartbeat_ack' }));
-                } else if (data.type === 'sync') {
-                    // guests sync to host
-                    if (!isHost) {
-                        if (data.song && (!audioPlayer.currentSong || data.song.id !== audioPlayer.currentSong.id)) {
-                            playSong(data.song, data.position || 0);
-                        }
-                        if (data.is_playing && audioPlayer.paused) {
-                            audioPlayer.play().catch(()=>{});
-                            playPauseIcon.classList.remove('fa-play');
-                            playPauseIcon.classList.add('fa-pause');
-                            isPlaying = true;
-                        } else if (!data.is_playing && !audioPlayer.paused) {
-                            audioPlayer.pause();
-                            playPauseIcon.classList.remove('fa-pause');
-                            playPauseIcon.classList.add('fa-play');
-                            isPlaying = false;
-                        }
-                        if (Math.abs((audioPlayer.currentTime || 0) - (data.position || 0)) > 1.0) {
-                            audioPlayer.currentTime = data.position || 0;
-                        }
-                        if (typeof data.volume !== 'undefined' && Math.abs(audioPlayer.volume - data.volume) > 0.05) {
-                            audioPlayer.volume = data.volume;
-                            volumeBar.value = Math.round(audioPlayer.volume * 100);
-                            volumeBar.style.setProperty('--volume', `${volumeBar.value}%`);
-                        }
-                    }
-                } else if (data.type === 'song_change') {
-                    if (!isHost) {
-                        playSong(data.song, data.position || 0);
-                        if (data.is_playing) {
-                            audioPlayer.play().then(() => {
-                                playPauseIcon.classList.remove('fa-play');
-                                playPauseIcon.classList.add('fa-pause');
-                                isPlaying = true;
-                            }).catch(() => {
-                                playPauseIcon.classList.remove('fa-pause');
-                                playPauseIcon.classList.add('fa-play');
-                                isPlaying = false;
-                            });
-                        }
-                    }
-                } else if (data.type === 'playlist_update') {
-                    if (!isHost) {
+                
+                console.log("Received WS message:", data.type, data);
+                
+                switch(data.type) {
+                    case 'heartbeat':
+                        // This is a ping from server, we do nothing. Our client sends its own heartbeat.
+                        break;
+                        
+                    case 'sync':
+                        handleSyncMessage(data);
+                        break;
+                        
+                    case 'song_change':
+                        handleSongChange(data);
+                        break;
+                        
+                    case 'playlist_update':
                         currentPlaylist = data.playlist || [];
                         renderPlaylist();
-                        // Try to play if host is playing and there's a current song
-                        if (audioPlayer.currentSong && isPlaying) {
-                            audioPlayer.play().catch(() => {});
+                        break;
+                        
+                    case 'initial_sync':
+                        handleInitialSync(data);
+                        updateParticipantsDisplay(data.host, data.guests);
+                        break;
+                        
+                    case 'participants_update':
+                        updateParticipantsDisplay(data.host, data.guests);
+                        break;
+                        
+                    case 'chat_message':
+                        addChatMessage(data.sender, data.message, data.timestamp, data.is_host);
+                        break;
+                        
+                    case 'seek':
+                        if (data.position !== undefined) {
+                            audioPlayer.currentTime = data.position;
                         }
-                    }
-                } else if (data.type === 'initial_sync') {
-                    updateParticipantsDisplay(data.host, data.guests);
-                    if (!isHost) {
-                        if (data.playlist && data.playlist.length) {
-                            currentPlaylist = data.playlist;
-                            renderPlaylist();
-                        }
-                        if (data.current_song) {
-                            playSong(data.current_song, data.position || 0);
-                            if (data.is_playing) {
-                                audioPlayer.play().then(() => {
-                                    playPauseIcon.classList.remove('fa-play');
-                                    playPauseIcon.classList.add('fa-pause');
-                                    isPlaying = true;
-                                }).catch(() => {
-                                    playPauseIcon.classList.remove('fa-pause');
-                                    playPauseIcon.classList.add('fa-play');
-                                    isPlaying = false;
-                                });
-                            }
-                            if (typeof data.volume !== 'undefined') {
-                                audioPlayer.volume = data.volume;
-                                volumeBar.value = Math.round(audioPlayer.volume * 100);
-                                volumeBar.style.setProperty('--volume', `${volumeBar.value}%`);
-                            }
-                        }
-                    }
-                } else if (data.type === 'participants_update') {
-                    updateParticipantsDisplay(data.host, data.guests);
+                        break;
+                        
+                    case 'jam_ended':
+                        alert("Jam session ended: " + (data.reason || "Host disconnected"));
+                        endJamSession();
+                        break;
                 }
             };
 
             jamSocket.onclose = (ev) => {
                 console.log("WS closed", ev.code, ev.reason);
-                if (ev.code !== 1000 && jamId) attemptReconnect();
-                else if (isHost) endJamSession();
+                if (ev.code === 1008) { // Policy Violation
+                    alert("Connection closed: " + ev.reason);
+                    endJamSession();
+                } else if (ev.code !== 1000 && jamId) {
+                    attemptReconnect();
+                } else {
+                    endJamSession();
+                }
             };
 
             jamSocket.onerror = (err) => {
                 console.error("WS error", err);
-                if (jamId) attemptReconnect();
             };
         }
+        
+        // This function sends frequent player state updates to the server.
+        function sendPlayerStateUpdate() {
+            if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN && isPlaying) {
+                jamSocket.send(JSON.stringify({
+                    type: "player_state_update",
+                    is_playing: isPlaying,
+                    position: audioPlayer.currentTime,
+                    volume: audioPlayer.volume
+                }));
+            }
+        }
 
-        function syncPlaylistWithGuests() {
-            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+        function handleSyncMessage(data) {
+            // If we receive a song that's different from the current one, treat it as a song change.
+            if (data.song && (!audioPlayer.currentSong || data.song.id !== audioPlayer.currentSong.id)) {
+                handleSongChange(data);
+                return;
+            }
+            
+            if (data.is_playing && audioPlayer.paused) {
+                audioPlayer.play().catch(err => {});
+                playPauseIcon.classList.remove('fa-play');
+                playPauseIcon.classList.add('fa-pause');
+                isPlaying = true;
+            } else if (!data.is_playing && !audioPlayer.paused) {
+                audioPlayer.pause();
+                playPauseIcon.classList.remove('fa-pause');
+                playPauseIcon.classList.add('fa-play');
+                isPlaying = false;
+            }
+            
+            // Only seek if the difference is significant, to avoid jitter
+            if (Math.abs((audioPlayer.currentTime || 0) - (data.position || 0)) > 2.0) {
+                audioPlayer.currentTime = data.position || 0;
+            }
+            
+            if (typeof data.volume !== 'undefined' && Math.abs(audioPlayer.volume - data.volume) > 0.05) {
+                audioPlayer.volume = data.volume;
+                volumeBar.value = Math.round(audioPlayer.volume * 100);
+                volumeBar.style.setProperty('--volume', volumeBar.value + '%');
+            }
+        }
+
+        function handleSongChange(data) {
+            // Stop current playback
+            audioPlayer.pause();
+            audioPlayer.src = '';
+            
+            if (!data.song) {
+                resetPlayerUI();
+                return;
+            }
+
+            // Update UI with new song info
+            audioPlayer.currentSong = data.song;
+            trackTitle.textContent = data.song.title;
+            artistName.textContent = data.song.artist || 'Unknown Artist';
+            albumArt.src = data.song.thumbnail || "https://placehold.co/128x128/4F46E5/FFFFFF?text=Album+Art";
+
+            // Set the new source
+            let audioUrl = data.song.url;
+            audioUrl += (audioUrl.includes('?') ? '&' : '?') + '_=' + Date.now();
+            audioPlayer.src = audioUrl;
+
+            // Load and play
+            audioPlayer.load();
+            if (data.is_playing) {
+                audioPlayer.play().catch(e => console.error("Autoplay failed after song change:", e));
+            }
+            
+            isPlaying = data.is_playing;
+            playPauseIcon.className = `fas ${isPlaying ? 'fa-pause' : 'fa-play'} text-xl md:text-2xl`;
+            
+            renderPlaylist(); // To update the highlight
+        }
+
+        function handleInitialSync(data) {
+            if (data.playlist) {
+                currentPlaylist = data.playlist;
+                renderPlaylist();
+            }
+            if (data.current_song) {
+                handleSongChange({
+                    song: data.current_song,
+                    is_playing: data.is_playing,
+                    position: data.position
+                });
+                
+                // Set initial position and volume
+                audioPlayer.onloadedmetadata = () => {
+                    if (data.position > 0) audioPlayer.currentTime = data.position;
+                    updateTotalTime();
+                };
+            }
+            if (typeof data.volume !== 'undefined') {
+                audioPlayer.volume = data.volume;
+                volumeBar.value = Math.round(audioPlayer.volume * 100);
+                volumeBar.style.setProperty('--volume', volumeBar.value + '%');
+            }
+        }
+
+        function syncPlaylistWithServer() {
+            if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
                 jamSocket.send(JSON.stringify({ type: 'playlist_update', playlist: currentPlaylist }));
             }
         }
 
-        // --- Playlist management (render/add/remove) ---
+        // --- Playlist management ---
         function renderPlaylist() {
             playlistContainer.innerHTML = '';
             if (!currentPlaylist.length) {
-                playlistContainer.innerHTML = '<p class="text-gray-500 text-center py-4">Playlist is empty. Add some songs!</p>';
-                resetPlayerUI();
+                playlistContainer.innerHTML = '<p class="text-gray-500 text-center py-4">Playlist is empty.</p>';
                 managePlaylistButton.disabled = true;
                 managePlaylistButton.classList.add('opacity-50','cursor-not-allowed');
                 return;
             }
             managePlaylistButton.disabled = false;
             managePlaylistButton.classList.remove('opacity-50','cursor-not-allowed');
+            
+            const currentSongId = audioPlayer.currentSong ? audioPlayer.currentSong.id : null;
+            currentSongIndex = currentSongId ? currentPlaylist.findIndex(s => s.id === currentSongId) : -1;
 
             currentPlaylist.forEach((song, idx) => {
                 const li = document.createElement('li');
@@ -1549,11 +1584,13 @@ frontend_html = """
 
                 li.addEventListener('click', (e) => {
                     if (e.target.closest('.remove-song-button')) return;
-                    if (currentSongIndex !== idx) {
+                     if (currentSongIndex !== idx) {
                         currentSongIndex = idx;
+                        isRotationMode = false;
                         playSong(currentPlaylist[currentSongIndex]);
-                        renderPlaylist();
-                    } else if (!isPlaying) togglePlayPause();
+                    } else if (!isPlaying) {
+                         togglePlayPause();
+                     }
                 });
             });
 
@@ -1567,70 +1604,73 @@ frontend_html = """
         }
 
         function addSongToPlaylist(song) {
+            if (currentPlaylist.some(s => s.id === song.id)) return;
+            isRotationMode = false;
             currentPlaylist.push(song);
             renderPlaylist();
-            syncPlaylistWithGuests();
+            syncPlaylistWithServer();
         }
 
         function removeSongFromPlaylist(songId) {
             const idx = currentPlaylist.findIndex(s => s.id === songId);
             if (idx === -1) return;
+
+            const isRemovingCurrent = (currentSongIndex === idx);
             currentPlaylist.splice(idx, 1);
-            if (currentSongIndex === idx) {
+
+            if (isRemovingCurrent) {
                 pauseSong();
-                if (currentPlaylist.length) {
-                    currentSongIndex = Math.min(currentSongIndex, currentPlaylist.length - 1);
+                if (currentPlaylist.length > 0) {
+                    currentSongIndex = idx % currentPlaylist.length;
                     playSong(currentPlaylist[currentSongIndex]);
                 } else {
                     currentSongIndex = -1;
                     resetPlayerUI();
                 }
-            } else if (currentSongIndex > idx) currentSongIndex--;
+            } else if (currentSongIndex > idx) {
+                currentSongIndex--;
+            }
+            
             renderPlaylist();
-            syncPlaylistWithGuests();
+            syncPlaylistWithServer();
+        }
+        
+        function playNextSong() {
+            if (!currentPlaylist.length) { 
+                resetPlayerUI(); 
+                return; 
+            }
+            if(isRotationMode) {
+                 playNextAndRotate();
+            } else {
+                currentSongIndex = (currentSongIndex + 1) % currentPlaylist.length;
+                playSong(currentPlaylist[currentSongIndex]);
+                renderPlaylist();
+            }
         }
 
-        function playNextSong() {
-            if (!currentPlaylist.length) { resetPlayerUI(); return; }
-            // Remove the current song
-            currentPlaylist.splice(currentSongIndex, 1);
-            // Add a new random song if available and playlist < 10
-            if (hostedSongs.length > 0 && currentPlaylist.length < 10) {
-                const availableSongs = hostedSongs.filter(song =>
-                    !currentPlaylist.some(s => s.id === song.id)
-                );
-                if (availableSongs.length > 0) {
-                    const randomIndex = Math.floor(Math.random() * availableSongs.length);
-                    const newSong = availableSongs[randomIndex];
-                    currentPlaylist.push(newSong);
-                }
+        function playNextAndRotate() {
+            if (!currentPlaylist.length) return resetPlayerUI();
+
+            const lastPlayedIndex = currentSongIndex;
+            currentPlaylist.splice(lastPlayedIndex, 1);
+
+            const availableSongs = hostedSongs.filter(song => !currentPlaylist.some(pSong => pSong.id === song.id));
+            if (availableSongs.length > 0) {
+                const newSong = availableSongs[Math.floor(Math.random() * availableSongs.length)];
+                currentPlaylist.push(newSong);
             }
-            // If playlist is empty, reset
-            if (currentPlaylist.length === 0) {
-                resetPlayerUI();
-                renderPlaylist();
-                syncPlaylistWithGuests();
-                return;
-            }
-            // Adjust index if needed
-            if (currentSongIndex >= currentPlaylist.length) {
-                currentSongIndex = 0;
-            }
+
+            if (currentPlaylist.length === 0) return resetPlayerUI();
+
+            currentSongIndex = (lastPlayedIndex >= currentPlaylist.length) ? 0 : lastPlayedIndex;
             playSong(currentPlaylist[currentSongIndex]);
             renderPlaylist();
-            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                jamSocket.send(JSON.stringify({ 
-                    type: 'host_update', 
-                    is_playing: true, 
-                    position: audioPlayer.currentTime, 
-                    volume: audioPlayer.volume 
-                }));
-                syncPlaylistWithGuests();
-            }
+            syncPlaylistWithServer();
         }
         
         function resetPlayerUI() {
-            pauseSong();
+            audioPlayer.pause();
             audioPlayer.src = '';
             audioPlayer.currentSong = null;
             progressBar.value = 0;
@@ -1640,36 +1680,28 @@ frontend_html = """
             trackTitle.textContent = 'No song loaded';
             artistName.textContent = '';
             albumArt.src = 'https://placehold.co/128x128/CCCCCC/FFFFFF?text=No+Track';
+            playPauseIcon.classList.remove('fa-pause');
+            playPauseIcon.classList.add('fa-play');
+            isPlaying = false;
+            if(jamId) syncPlaylistWithServer();
         }
 
         // --- YouTube Audio Streaming Functions ---
         async function getYouTubeStream(videoId) {
-            try {
-                const response = await fetch(`/youtube/stream/${videoId}`);
-                if (!response.ok) throw new Error('Failed to get YouTube stream');
-                return await response.json();
-            } catch (error) {
-                console.error('YouTube stream error:', error);
-                throw error;
-            }
+            const response = await fetch(`/youtube/stream/${videoId}`);
+            if (!response.ok) throw new Error('Failed to get YouTube stream');
+            return await response.json();
         }
 
         async function searchYouTube(query) {
-            try {
-                const response = await fetch(`/youtube/search?query=${encodeURIComponent(query)}`);
-                if (!response.ok) throw new Error('YouTube search failed');
-                const data = await response.json();
-                return data.results || [];
-            } catch (error) {
-                console.error('YouTube search error:', error);
-                return [];
-            }
+            const response = await fetch(`/youtube/search?query=${encodeURIComponent(query)}`);
+            if (!response.ok) throw new Error('YouTube search failed');
+            return (await response.json()).results || [];
         }
 
         async function playYouTubeAudio(videoId, immediate = false) {
             try {
                 showLoadingIndicator(true);
-                
                 const streamInfo = await getYouTubeStream(videoId);
                 
                 const youtubeSong = {
@@ -1682,33 +1714,47 @@ frontend_html = """
                     source: 'youtube'
                 };
                 
+                isRotationMode = false;
                 if (immediate) {
-                    // Play immediately
-                    currentPlaylist = [youtubeSong];
-                    currentSongIndex = 0;
+                    currentPlaylist.splice(currentSongIndex + 1, 0, youtubeSong);
+                    currentSongIndex++;
                     renderPlaylist();
                     playSong(youtubeSong);
+                    syncPlaylistWithServer();
                 } else {
-                    // Add to playlist
                     addSongToPlaylist(youtubeSong);
                 }
                 
             } catch (error) {
-                console.error('YouTube audio playback failed:', error);
                 alert('Failed to play YouTube audio: ' + error.message);
             } finally {
                 showLoadingIndicator(false);
             }
         }
+        
+        async function refreshYouTubeStream(videoId) {
+            const streamInfo = await getYouTubeStream(videoId);
+            return {
+                id: `yt_${videoId}`,
+                title: streamInfo.title,
+                artist: streamInfo.artist || 'YouTube Artist',
+                url: streamInfo.url,
+                thumbnail: streamInfo.thumbnail || 'https://placehold.co/128x128/FF0000/FFFFFF?text=YouTube',
+                duration: streamInfo.duration,
+                source: 'youtube'
+            };
+        }
 
         function showLoadingIndicator(show) {
+            let loader = document.getElementById('youtube-loader');
             if (show) {
-                const loader = document.createElement('div');
-                loader.id = 'youtube-loader';
-                loader.innerHTML = '<div class="fixed top-0 left-0 w-full h-full bg-black bg-opacity-50 flex items-center justify-center z-50"><div class="bg-white p-4 rounded-lg"><i class="fas fa-spinner fa-spin text-2xl text-indigo-600"></i><p class="mt-2">Loading YouTube audio...</p></div></div>';
-                document.body.appendChild(loader);
+                if (!loader) {
+                    loader = document.createElement('div');
+                    loader.id = 'youtube-loader';
+                    loader.innerHTML = '<div class="fixed top-0 left-0 w-full h-full bg-black bg-opacity-50 flex items-center justify-center z-50"><div class="bg-white p-4 rounded-lg"><i class="fas fa-spinner fa-spin text-2xl text-indigo-600"></i><p class="mt-2">Loading audio...</p></div></div>';
+                    document.body.appendChild(loader);
+                }
             } else {
-                const loader = document.getElementById('youtube-loader');
                 if (loader) loader.remove();
             }
         }
@@ -1717,7 +1763,7 @@ frontend_html = """
         function openUnifiedSearchModal() {
             unifiedSearchModal.classList.remove('hidden');
             unifiedSearchInput.value = '';
-            unifiedSearchResults.innerHTML = '<p class="text-gray-500 text-center py-4">Start typing to search for songs...</p>';
+            unifiedSearchResults.innerHTML = '<p class="text-gray-500 text-center py-4">Start typing to search...</p>';
             if (!hostedSongs.length) fetchHostedSongs();
             unifiedSearchInput.focus();
         }
@@ -1729,246 +1775,198 @@ frontend_html = """
         async function performUnifiedSearch() {
             const query = unifiedSearchInput.value.trim();
             if (!query) return;
-            
-            unifiedSearchResults.innerHTML = '<p class="text-gray-500 text-center py-4"><i class="fas fa-spinner fa-spin mr-2"></i>Searching...</p>';
+            unifiedSearchResults.innerHTML = '<p class="text-center py-4"><i class="fas fa-spinner fa-spin mr-2"></i>Searching...</p>';
             
             try {
-                // Search local songs first
                 const localResults = hostedSongs.filter(song => 
                     song.title.toLowerCase().includes(query.toLowerCase()) || 
                     (song.artist && song.artist.toLowerCase().includes(query.toLowerCase()))
                 ).slice(0, 5);
-                
-                // Search YouTube
                 const youtubeResults = await searchYouTube(query);
                 
-                // Combine and display results
                 unifiedSearchResults.innerHTML = '';
-                
-                if (localResults.length === 0 && youtubeResults.length === 0) {
-                    unifiedSearchResults.innerHTML = '<p class="text-gray-500 text-center py-4">No results found</p>';
+                if (!localResults.length && !youtubeResults.length) {
+                    unifiedSearchResults.innerHTML = '<p class="text-center py-4">No results found</p>';
                     return;
                 }
                 
-                // Show local results
-                if (localResults.length > 0) {
-                    const localHeader = document.createElement('div');
-                    localHeader.className = 'text-sm font-semibold text-gray-700 mb-2';
-                    localHeader.textContent = 'Local Songs';
-                    unifiedSearchResults.appendChild(localHeader);
-                    
-                    localResults.forEach(song => {
-                        const item = createSearchResultItem(song, 'local');
-                        unifiedSearchResults.appendChild(item);
-                    });
+                if (localResults.length) {
+                    const header = document.createElement('div');
+                    header.className = 'text-sm font-semibold text-gray-700 mb-2';
+                    header.textContent = 'Local Songs';
+                    unifiedSearchResults.appendChild(header);
+                    localResults.forEach(song => unifiedSearchResults.appendChild(createSearchResultItem(song, 'local')));
                 }
                 
-                // Show YouTube results
-                if (youtubeResults.length > 0) {
-                    const youtubeHeader = document.createElement('div');
-                    youtubeHeader.className = 'text-sm font-semibold text-gray-700 mb-2 mt-4';
-                    youtubeHeader.textContent = 'YouTube Results';
-                    unifiedSearchResults.appendChild(youtubeHeader);
-                    
-                    youtubeResults.forEach(video => {
-                        const item = createSearchResultItem(video, 'youtube');
-                        unifiedSearchResults.appendChild(item);
-                    });
+                if (youtubeResults.length) {
+                    const header = document.createElement('div');
+                    header.className = 'text-sm font-semibold text-gray-700 mb-2 mt-4';
+                    header.textContent = 'YouTube Results';
+                    unifiedSearchResults.appendChild(header);
+                    youtubeResults.forEach(video => unifiedSearchResults.appendChild(createSearchResultItem(video, 'youtube')));
                 }
-                
             } catch (error) {
-                console.error('Search error:', error);
-                unifiedSearchResults.innerHTML = '<p class="text-red-500 text-center py-4">Search failed. Please try again.</p>';
+                unifiedSearchResults.innerHTML = '<p class="text-red-500 text-center py-4">Search failed.</p>';
             }
         }
 
         function createSearchResultItem(item, source) {
             const resultDiv = document.createElement('div');
-            resultDiv.className = 'search-result flex items-center justify-between p-3 bg-gray-100 rounded-md mb-2 cursor-pointer hover:bg-gray-200 transition-colors';
-            
-            const itemData = {
-                ...item,
-                source: source
-            };
+            resultDiv.className = 'search-result flex items-center justify-between p-3 bg-gray-100 rounded-md mb-2 hover:bg-gray-200 transition-colors';
             
             resultDiv.innerHTML = `
-                <div class="flex items-center min-w-0 flex-grow">
-                    <img src="${item.thumbnail || 'https://placehold.co/40x40/CCCCCC/FFFFFF?text=MP3'}" 
-                         class="w-10 h-10 rounded-md mr-3 object-cover">
+                <div class="flex items-center min-w-0 flex-grow cursor-pointer">
+                    <img src="${item.thumbnail || 'https://placehold.co/40x40/CCCCCC/FFFFFF?text=MP3'}" class="w-10 h-10 rounded-md mr-3 object-cover">
                     <div class="min-w-0 flex-grow">
                         <p class="font-medium text-sm truncate">${item.title}</p>
                         <p class="text-xs text-gray-500 truncate">${item.artist || 'Unknown Artist'}</p>
                     </div>
                     ${source === 'youtube' ? '<span class="youtube-badge">YT</span>' : ''}
                 </div>
-                <button class="add-search-result ml-3 px-3 py-1 bg-indigo-500 text-white text-xs rounded-md hover:bg-indigo-600 transition-colors duration-200" 
-                        data-item='${JSON.stringify(itemData).replace(/'/g, "&#39;")}'>
-                    Add
-                </button>
+                <button class="add-search-result ml-3 px-3 py-1 bg-indigo-500 text-white text-xs rounded-md hover:bg-indigo-600">Add</button>
             `;
             
-            // Add event listeners
             const addButton = resultDiv.querySelector('.add-search-result');
-            addButton.addEventListener('click', (e) => {
+            addButton.addEventListener('click', async (e) => {
                 e.stopPropagation();
-                const itemData = JSON.parse(e.target.dataset.item.replace(/&#39;/g, "'"));
-                
-                if (itemData.source === 'local') {
-                    addSongToPlaylist(itemData);
-                    e.target.textContent = 'Added';
-                    e.target.disabled = true;
-                    e.target.classList.remove('bg-indigo-500', 'hover:bg-indigo-600');
-                    e.target.classList.add('bg-gray-400', 'cursor-not-allowed');
-                }
-            });
-            
-            resultDiv.addEventListener('click', (e) => {
-                if (!e.target.classList.contains('add-search-result')) {
-                    const btn = resultDiv.querySelector('.add-search-result');
-                    const itemData = JSON.parse(btn.dataset.item.replace(/&#39;/g, "'"));
-                    
-                    if (itemData.source === 'local') {
-                        // Play local song immediately
-                        currentPlaylist = [itemData];
-                        currentSongIndex = 0;
-                        renderPlaylist();
-                        playSong(itemData);
-                        closeUnifiedSearchModal();
-                    } else {
-                        // Play YouTube audio immediately
-                        playYouTubeAudio(itemData.id, true);
-                        closeUnifiedSearchModal();
+                addButton.textContent = 'Adding...';
+                addButton.disabled = true;
+
+                try {
+                    if (source === 'local') {
+                        addSongToPlaylist(item);
+                    } else if (source === 'youtube') {
+                        showLoadingIndicator(true);
+                        const streamInfo = await getYouTubeStream(item.id);
+                        const youtubeSong = {
+                            id: `yt_${item.id}`, title: streamInfo.title, artist: streamInfo.artist,
+                            url: streamInfo.url, thumbnail: streamInfo.thumbnail, duration: streamInfo.duration, source: 'youtube'
+                        };
+                        addSongToPlaylist(youtubeSong);
                     }
+                    addButton.textContent = 'Added';
+                    addButton.classList.replace('bg-indigo-500', 'bg-gray-400');
+                } catch (error) {
+                    alert('Failed to add song: ' + error.message);
+                    addButton.textContent = 'Add';
+                    addButton.disabled = false;
+                } finally {
+                    showLoadingIndicator(false);
                 }
             });
             
+            resultDiv.querySelector('.min-w-0').addEventListener('click', () => {
+                 isRotationMode = false;
+                 if (source === 'local') {
+                    addSongToPlaylist(item);
+                    if (!audioPlayer.currentSong) {
+                        currentSongIndex = currentPlaylist.length - 1;
+                        playSong(item);
+                    }
+                    closeUnifiedSearchModal();
+                } else {
+                    playYouTubeAudio(item.id, true);
+                    closeUnifiedSearchModal();
+                }
+            });
             return resultDiv;
         }
 
         // --- Hosted songs functions ---
         async function fetchHostedSongs() {
             try {
-                const res = await fetch('/get-songs');
-                hostedSongs = await res.json();
+                hostedSongs = await (await fetch('/get-songs')).json();
             } catch (e) {
                 console.error('fetchHostedSongs failed', e);
-                hostedSongs = [];
             }
         }
 
         function playRandomSongsWithRotation() {
-            if (!hostedSongs.length) {
-                alert('No hosted songs available to play randomly. Try adding some.');
-                return;
-            }
-            if (jamId && !isHost) {
-                alert('Only the host can modify the playlist in a jam session.');
-                return;
-            }
+            if (!hostedSongs.length) return alert('No hosted songs available.');
+            
+            isRotationMode = true;
             const shuffled = [...hostedSongs].sort(() => 0.5 - Math.random());
-            const randomSongs = shuffled.slice(0, Math.min(5, hostedSongs.length));
-            currentPlaylist = randomSongs;
+            currentPlaylist = shuffled.slice(0, Math.min(5, hostedSongs.length));
             currentSongIndex = 0;
             renderPlaylist();
-            syncPlaylistWithGuests();
+            syncPlaylistWithServer();
             playSong(currentPlaylist[currentSongIndex]);
         }
 
         // --- Event listeners ---
         playPauseButton.addEventListener('click', togglePlayPause);
         audioPlayer.addEventListener('timeupdate', updateProgressBar);
+        
         audioPlayer.addEventListener('ended', () => {
-    if (autoplayEnabled) {
-        // Remove the completed song
-        currentPlaylist.splice(currentSongIndex, 1);
-
-        // If playlist is empty, reset
-        if (currentPlaylist.length === 0) {
-            resetPlayerUI();
-            renderPlaylist();
-            syncPlaylistWithGuests();
-            currentSongIndex = -1;
-            return;
-        }
-
-        // If currentSongIndex is out of bounds, reset to 0
-        if (currentSongIndex >= currentPlaylist.length) {
-            currentSongIndex = 0;
-        }
-
-        playSong(currentPlaylist[currentSongIndex]);
-        renderPlaylist();
-        syncPlaylistWithGuests();
-    } else {
-        pauseSong();
-    }
-});
-        audioPlayer.addEventListener('volumechange', () => {
-            volumeBar.style.setProperty('--volume', `${audioPlayer.volume * 100}%`);
-            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                jamSocket.send(JSON.stringify({ type: 'host_update', is_playing: isPlaying, position: audioPlayer.currentTime, volume: audioPlayer.volume }));
+            if (autoplayEnabled && currentPlaylist.length > 0) {
+                 if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+                    // In a jam, only one client (usually the first to finish) should send this.
+                    // The server will handle advancing the playlist for everyone.
+                    jamSocket.send(JSON.stringify({ type: 'song_ended' }));
+                } else if (!jamId) {
+                    // Solo mode
+                    playNextSong();
+                }
+            } else {
+                pauseSong();
             }
         });
 
+        audioPlayer.addEventListener('volumechange', () => {
+            volumeBar.style.setProperty('--volume', audioPlayer.volume * 100 + '%');
+            // Volume changes are local unless the user is the host and explicitly syncs
+        });
+
+        progressBar.addEventListener('mousedown', () => { isSeeking = true; });
+        progressBar.addEventListener('mouseup', () => { isSeeking = false; });
         progressBar.addEventListener('input', () => {
-            if (isNaN(audioPlayer.duration) || audioPlayer.duration <= 0) return;
+            if (!isSeeking || isNaN(audioPlayer.duration)) return;
+            const seekTime = (progressBar.value / 100) * audioPlayer.duration;
+            currentTimeSpan.textContent = formatTime(seekTime);
+        });
+        progressBar.addEventListener('change', () => { // 'change' fires after mouse up
+            if (isNaN(audioPlayer.duration)) return;
             const seekTime = (progressBar.value / 100) * audioPlayer.duration;
             audioPlayer.currentTime = seekTime;
-            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                jamSocket.send(JSON.stringify({ type: 'host_update', is_playing: isPlaying, position: audioPlayer.currentTime, volume: audioPlayer.volume }));
+            if (jamId && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+                jamSocket.send(JSON.stringify({ type: 'seek', position: seekTime }));
             }
         });
 
-        volumeBar.addEventListener('input', (e) => {
-            audioPlayer.volume = e.target.value / 100;
-        });
+        volumeBar.addEventListener('input', (e) => audioPlayer.volume = e.target.value / 100);
 
         nextButton.addEventListener('click', playNextSong);
         autoplayToggle.addEventListener('click', toggleAutoplay);
-
         rewindButton.addEventListener('click', () => {
-            audioPlayer.currentTime = Math.max(0, audioPlayer.currentTime - 10);
-            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                jamSocket.send(JSON.stringify({ type: 'host_update', is_playing: isPlaying, position: audioPlayer.currentTime, volume: audioPlayer.volume }));
-            }
+            const newTime = Math.max(0, audioPlayer.currentTime - 10);
+            audioPlayer.currentTime = newTime;
+            if (jamId) jamSocket.send(JSON.stringify({ type: 'seek', position: newTime }));
         });
-
         forwardButton.addEventListener('click', () => {
-            audioPlayer.currentTime = Math.min(audioPlayer.duration || 0, audioPlayer.currentTime + 10);
-            if (isHost && jamSocket && jamSocket.readyState === WebSocket.OPEN) {
-                jamSocket.send(JSON.stringify({ type: 'host_update', is_playing: isPlaying, position: audioPlayer.currentTime, volume: audioPlayer.volume }));
-            }
+            const newTime = Math.min(audioPlayer.duration || 0, audioPlayer.currentTime + 10);
+            audioPlayer.currentTime = newTime;
+            if (jamId) jamSocket.send(JSON.stringify({ type: 'seek', position: newTime }));
         });
 
-        // Replace the existing event listener for the random songs button
         playRandomHostedSongsButton.addEventListener('click', playRandomSongsWithRotation);
-
-        // Replace the add options button to use unified search
         showAddOptionsButton.addEventListener('click', openUnifiedSearchModal);
 
         // Unified search event listeners
         unifiedSearchButton.addEventListener('click', performUnifiedSearch);
-        unifiedSearchInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') performUnifiedSearch();
-        });
+        unifiedSearchInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') performUnifiedSearch(); });
         closeSearchModal.addEventListener('click', closeUnifiedSearchModal);
         doneSearchButton.addEventListener('click', closeUnifiedSearchModal);
 
         sendChatButton.addEventListener('click', () => {
             const msg = chatInput.value.trim();
-            if (!msg) return;
-            if (msg.length > 500) { alert('Message too long (max 500 chars)'); return; }
-            if (!jamSocket || jamSocket.readyState !== WebSocket.OPEN) return alert('Not connected to jam');
-            jamSocket.send(JSON.stringify({ type: 'chat_message', message: msg }));
-            chatInput.value = '';
+            if (!msg || msg.length > 500) return;
+            if (jamSocket && jamSocket.readyState === WebSocket.OPEN) {
+                jamSocket.send(JSON.stringify({ type: 'chat_message', message: msg }));
+                chatInput.value = '';
+            }
         });
-        chatInput.addEventListener('input', () => {
-            // simple client-side trim
-            chatInput.value = chatInput.value.replace(/^\s+|\s+$/g, '');
-        });
-        chatInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') sendChatButton.click();
-        });
+
+        chatInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendChatButton.click(); });
         jamCopyLink.addEventListener('click', () => {
             navigator.clipboard.writeText(jamLinkInput.value)
                 .then(() => {
@@ -1977,67 +1975,26 @@ frontend_html = """
                 });
         });
         cancelReconnectButton.addEventListener('click', cancelReconnect);
-        jamToggle.addEventListener('click', () => {
-            if (jamId) {
-                endJamSession();
-            } else {
-                startJamSession();
-            }
-        });
+        jamToggle.addEventListener('click', () => jamId ? endJamSession() : startJamSession());
 
         document.addEventListener('DOMContentLoaded', () => {
             fetchHostedSongs();
             resetPlayerUI();
             renderPlaylist();
-            // sync volume UI
             volumeBar.value = Math.round((audioPlayer.volume || 1) * 100);
-            volumeBar.style.setProperty('--volume', `${volumeBar.value}%`);
-            // Load autoplay state from localStorage
+            volumeBar.style.setProperty('--volume', volumeBar.value + '%');
             const savedAutoplay = localStorage.getItem('autoplayEnabled');
             if (savedAutoplay === 'true') {
                 autoplayEnabled = true;
                 autoplayToggle.classList.add('active');
-                autoplayToggle.title = 'Autoplay: ON';
             }
-            // auto-join if jam param present
             const params = new URLSearchParams(window.location.search);
             const jamParam = params.get('jam');
             if (jamParam) joinJamSession(jamParam);
+            
+            // Start interval to send player state updates
+            syncInterval = setInterval(sendPlayerStateUpdate, 1000); // Send updates every second
         });
-
-        function retryAudioLoad(song, maxRetries = 3, delay = 1000) {
-    let retries = 0;
-
-    function tryLoad() {
-        if (retries >= maxRetries) {
-            console.error("Max retries reached for audio load");
-            handleAudioError();
-            return;
-        }
-        retries++;
-
-        const audioUrl = song.url.includes('?') ? `${song.url}&_=${Date.now()}` : `${song.url}?_=${Date.now()}`;
-        const audio = new Audio(audioUrl);
-
-        audio.onloadedmetadata = () => {
-            audioPlayer.src = audioUrl;
-            audioPlayer.currentSong = song;
-            audioPlayer.play().catch(err => {
-                console.error("Error playing audio after retry:", err);
-                playPauseIcon.classList.remove('fa-pause');
-                playPauseIcon.classList.add('fa-play');
-                isPlaying = false;
-            });
-        };
-
-        audio.onerror = () => {
-            console.warn(`Retry ${retries} failed, retrying...`);
-            setTimeout(tryLoad, delay);
-        };
-    }
-
-    tryLoad();
-}
     </script>
 </body>
 </html>
@@ -2051,7 +2008,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     
     # This is the correct way to run uvicorn programmatically
-
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
-
-
+    uvicorn.run("app:app",port=port, reload=True)
