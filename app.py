@@ -617,6 +617,7 @@ frontend_html = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="google-adsense-account" content="ca-pub-8346311897787343">
     <title>Audio Player</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
@@ -2052,4 +2053,5 @@ if __name__ == "__main__":
     # This is the correct way to run uvicorn programmatically
 
     uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+
 
