@@ -655,6 +655,7 @@ frontend_html = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="google-site-verification" content="tO7b8L4nGaugCRWpX0o61nv2CyPTbYX6ILEDcQSd6DI" />
     <title>Synq Music Player</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
@@ -2070,4 +2071,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     
     # This is the correct way to run uvicorn programmatically
+
     uvicorn.run("app:app",port=port, reload=True)
