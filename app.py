@@ -14,6 +14,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPExceptio
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from fastapi.responses import FileResponse
 
 # ----------------------------
 # Logging & App setup
@@ -41,9 +42,10 @@ app.add_middleware(
 # ----------------------------
 # Routes
 # ----------------------------
-@app.route('/ads.txt')
-def serve_ads():
-    return send_from_directory(os.getcwd(), 'ads.txt', mimetype='text/plain')
+@app.get("/ads.txt")
+async def serve_ads():
+    # Use FileResponse to serve the ads.txt file
+    return FileResponse("ads.txt", media_type="text/plain")
 
 # ----------------------------
 # Config / State
@@ -2079,5 +2081,6 @@ if __name__ == "__main__":
     # This is the correct way to run uvicorn programmatically
 
     uvicorn.run("app:app",port=port, reload=True)
+
 
 
